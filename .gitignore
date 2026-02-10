@@ -1,0 +1,53 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Env and secrets
+.env
+.flaskenv
+.env.*
+!.env.example
+
+# Flask
+instance/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and runtime
+logs/
+*.log
+error.log
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution / build
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# mypy
+.mypy_cache/
