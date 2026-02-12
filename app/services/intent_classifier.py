@@ -15,10 +15,10 @@ Layer 2 - 细分类（LLM，仅 needs_search=true 时执行）:
 import json
 import re
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 from loguru import logger
 
-from app.services.schemas import ClassificationResult
+from app.services.schemas import ClassificationResult, HistoryMessage
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +99,8 @@ _NEEDS_SEARCH_PROMPT = """判断以下查询是否需要检索最近的新闻、
 
 判断标准：
 - true：用户想了解最近发生的事、新闻动态、价格行情、政策变化、比赛结果等时效性信息
-- false：闲聊、主观评价、常识百科、概念解释、历史知识、数学计算、个人建议
-
+- false：闲聊、主观评价、常识百科、概念解释、历史知识、数学计算、个人建议、对前文已知信息的追问
+{history_block}
 查询：{query}
 
 需要检索："""
@@ -109,6 +109,8 @@ _NEEDS_SEARCH_PROMPT = """判断以下查询是否需要检索最近的新闻、
 # 细分类 Prompt（Stage 2，仅 needs_search=true 时执行）
 # ---------------------------------------------------------------------------
 
+_CATEGORY_OPTIONS = "academic | world | tech | economy | sports | health | general"
+
 _DETAIL_CLASSIFY_PROMPT = """你是一个意图分类助手。对以下需要检索的查询进行分类，只输出JSON。
 
 今日日期：{current_date}
@@ -116,15 +118,15 @@ _DETAIL_CLASSIFY_PROMPT = """你是一个意图分类助手。对以下需要检
 
 分类字段：
 1. intent_type: news（新闻事件）| realtime_quote（实时行情价格）
-2. filter_category（检索类别，按查询主体领域选）:
-   academic | world | tech | economy | sports | health | general
-   核心原则：按主体分类。"NBA交易"→sports，"苹果发布会"→tech，"金价"→economy
+2. filter_categories（检索类别 top3，按与查询相关度从高到低排列，最多 3 个）:
+   可选值：{category_options}
+   核心原则：按主体与查询相关度排序。如"NBA交易"→["sports"]，"苹果股价与芯片"→["tech","economy"]。只填 1～3 个。
 3. time_sensitivity: realtime | recent | historical | none
 4. confidence: 0-1
 5. reference_datetime: 用户提及的日期(YYYY-MM-DD)或null
 
-只输出一行紧凑JSON：
-{{"intent_type":"news","filter_category":"general","time_sensitivity":"recent","confidence":0.9,"reference_datetime":null}}"""
+只输出一行紧凑JSON，filter_categories 为数组：
+{{"intent_type":"news","filter_categories":["general"],"time_sensitivity":"recent","confidence":0.9,"reference_datetime":null}}"""
 
 
 class IntentClassifier:
@@ -137,8 +139,9 @@ class IntentClassifier:
         Layer 2: 细分类 (LLM) → 仅 needs_search=true 时
     """
 
-    # 暴露给 Pipeline tracer（兼容旧接口）
+    # 暴露给 Pipeline tracer（兼容旧接口）；format 时需传入 category_options
     CLASSIFY_PROMPT = _DETAIL_CLASSIFY_PROMPT
+    CATEGORY_OPTIONS = _CATEGORY_OPTIONS
 
     def __init__(self, local_llm_service=None):
         self._local_llm = local_llm_service
@@ -158,6 +161,8 @@ class IntentClassifier:
         self,
         standalone_query: str,
         current_date: Optional[str] = None,
+        history: Optional[List[HistoryMessage]] = None,
+        original_query: Optional[str] = None,
     ) -> ClassificationResult:
         if current_date is None:
             current_date = datetime.now().strftime("%Y-%m-%d")
@@ -174,7 +179,7 @@ class IntentClassifier:
             return rule_result
 
         # ===== Layer 1: needs_search 二分类 (LLM) =====
-        needs_search = self._llm_needs_search(query)
+        needs_search = self._llm_needs_search(query, history=history, original_query=original_query)
 
         if not needs_search:
             logger.info(f"[Classifier] LLM 判定不需要检索: {query}")
@@ -182,6 +187,7 @@ class IntentClassifier:
                 needs_search=False,
                 intent_type="knowledge",
                 filter_category="general",
+                filter_categories=["general"],
                 time_sensitivity="none",
                 confidence=0.8,
             )
@@ -205,7 +211,8 @@ class IntentClassifier:
         if lower in _CHITCHAT_EXACT:
             return ClassificationResult(
                 needs_search=False, intent_type="chitchat",
-                filter_category="general", time_sensitivity="none", confidence=0.95,
+                filter_category="general", filter_categories=["general"],
+                time_sensitivity="none", confidence=0.95,
             )
 
         # 2. 知识 / 主观评价模式
@@ -213,14 +220,16 @@ class IntentClassifier:
             if pat in lower:
                 return ClassificationResult(
                     needs_search=False, intent_type="knowledge",
-                    filter_category="general", time_sensitivity="none", confidence=0.85,
+                    filter_category="general", filter_categories=["general"],
+                    time_sensitivity="none", confidence=0.85,
                 )
 
         # 3. 疑似乱码（纯 ASCII 且不含常见英文词）
         if _GIBBERISH_RE.match(query) and not _COMMON_ENGLISH.search(query):
             return ClassificationResult(
                 needs_search=False, intent_type="chitchat",
-                filter_category="general", time_sensitivity="none", confidence=0.9,
+                filter_category="general", filter_categories=["general"],
+                time_sensitivity="none", confidence=0.9,
             )
 
         # 4. 强时效性信号 + 领域关键词 → 直接放行搜索
@@ -234,6 +243,7 @@ class IntentClassifier:
                 needs_search=True,
                 intent_type="realtime_quote" if time_sens == "realtime" else "news",
                 filter_category=matched_cat,
+                filter_categories=[matched_cat],
                 time_sensitivity=time_sens,
                 confidence=0.9,
             )
@@ -244,6 +254,7 @@ class IntentClassifier:
                 needs_search=True,
                 intent_type="news",
                 filter_category=matched_cat or "general",
+                filter_categories=[matched_cat] if matched_cat else ["general"],
                 time_sensitivity="recent",
                 confidence=0.9,
             )
@@ -255,13 +266,48 @@ class IntentClassifier:
     # Layer 1: needs_search 二分类 (LLM)
     # ------------------------------------------------------------------
 
-    def _llm_needs_search(self, query: str) -> bool:
-        """用极简 prompt 让 LLM 做 true/false 二分类。"""
+    @staticmethod
+    def _format_history_for_search_check(
+        history: Optional[List[HistoryMessage]],
+    ) -> str:
+        """
+        为 needs_search 判断构造历史摘要。
+        仅取最近 1 轮（1 user + 1 assistant），assistant 截断至 100 字。
+        """
+        if not history or len(history) < 2:
+            return ""
+        recent = history[-2:]  # 最近 1 轮
+        lines = []
+        for msg in recent:
+            content = msg.content.strip()
+            if len(content) > 100:
+                content = content[:100] + "..."
+            role = "用户" if msg.role == "user" else "助手"
+            lines.append(f"{role}：{content}")
+        return "\n最近对话摘要：\n" + "\n".join(lines) + "\n"
+
+    def _llm_needs_search(
+        self,
+        query: str,
+        history: Optional[List[HistoryMessage]] = None,
+        original_query: Optional[str] = None,
+    ) -> bool:
+        """用极简 prompt 让 LLM 做 true/false 二分类，注入对话历史作为上下文。"""
         if not self.local_llm.is_available:
             logger.warning("[Classifier] 本地模型不可用，默认不搜索")
             return False
 
-        prompt = _NEEDS_SEARCH_PROMPT.format(query=query)
+        history_block = self._format_history_for_search_check(history)
+        # 当原始表述与改写后差异较大时，同时展示两者，
+        # 让分类器看到原始语气/情感信号（改写过程中容易丢失）
+        if original_query and original_query.strip() != query.strip():
+            display_query = f"{query}\n（用户原始表述：{original_query}）"
+        else:
+            display_query = query
+        prompt = _NEEDS_SEARCH_PROMPT.format(
+            query=display_query,
+            history_block=history_block,
+        )
         try:
             raw = self.local_llm.chat(
                 messages=[{"role": "user", "content": prompt}],
@@ -284,6 +330,7 @@ class IntentClassifier:
         prompt = _DETAIL_CLASSIFY_PROMPT.format(
             current_date=current_date,
             query=query,
+            category_options=_CATEGORY_OPTIONS,
         )
         messages = [{"role": "user", "content": prompt}]
 
@@ -296,7 +343,7 @@ class IntentClassifier:
                     temperature=0.1,
                     max_tokens=256,
                 )
-                return _to_classification(result)
+                return _to_classification(result, query)
             except Exception as e:
                 logger.warning(f"[Classifier] Schema 细分类失败，降级 JSON 解析: {e}")
 
@@ -321,25 +368,43 @@ class IntentClassifier:
 # ---------------------------------------------------------------------------
 
 from pydantic import BaseModel, Field  # noqa: E402
-from typing import Literal  # noqa: E402
+from typing import List, Literal  # noqa: E402
 
 
 class _DetailClassifyResult(BaseModel):
     intent_type: Literal["news", "realtime_quote"] = "news"
-    filter_category: Literal[
-        "academic", "world", "tech", "economy", "sports", "health", "general"
-    ] = "general"
+    filter_categories: List[str] = Field(
+        default_factory=lambda: ["general"],
+        description="检索类别 top3，按相关度排序，最多 3 个",
+    )
     time_sensitivity: Literal["realtime", "recent", "historical", "none"] = "recent"
     confidence: float = Field(default=0.8, ge=0.0, le=1.0)
     reference_datetime: Optional[str] = None
 
 
-def _to_classification(detail: _DetailClassifyResult) -> ClassificationResult:
+def _normalize_categories(cats: List[str], query: str) -> List[str]:
+    """规范为合法类别列表，最多 3 个；非法项用 general 或规则匹配替代。"""
+    out: List[str] = []
+    for c in (cats or [])[:3]:
+        c = _LEGACY_CATEGORY_MAP.get(c, c)
+        if c in _VALID_CATEGORIES:
+            out.append(c)
+        else:
+            out.append(_match_category(query.lower()) or "general")
+    if not out:
+        out = [_match_category(query.lower()) or "general"]
+    return out[:3]
+
+
+def _to_classification(detail: _DetailClassifyResult, query: str = "") -> ClassificationResult:
     """将 Stage 2 结果转为完整 ClassificationResult（needs_search=True）。"""
+    cats = _normalize_categories(detail.filter_categories, query)
+    primary = cats[0] if cats else "general"
     return ClassificationResult(
         needs_search=True,
         intent_type=detail.intent_type,
-        filter_category=detail.filter_category,
+        filter_category=primary,
+        filter_categories=cats,
         time_sensitivity=detail.time_sensitivity,
         confidence=detail.confidence,
         reference_datetime=detail.reference_datetime,
@@ -386,10 +451,13 @@ def _parse_detail_json(raw_output: str, query: str) -> ClassificationResult:
     if intent_type not in ("news", "realtime_quote"):
         intent_type = "news"
 
-    filter_category = data.get("filter_category", "general")
-    filter_category = _LEGACY_CATEGORY_MAP.get(filter_category, filter_category)
-    if filter_category not in _VALID_CATEGORIES:
-        filter_category = _match_category(query.lower()) or "general"
+    raw_cats = data.get("filter_categories") or data.get("filter_category")
+    if isinstance(raw_cats, str):
+        raw_cats = [raw_cats]
+    if not isinstance(raw_cats, list):
+        raw_cats = ["general"]
+    filter_categories = _normalize_categories(raw_cats[:3], query)
+    filter_category = filter_categories[0] if filter_categories else "general"
 
     time_sensitivity = data.get("time_sensitivity", "recent")
     if time_sensitivity not in ("realtime", "recent", "historical", "none"):
@@ -416,6 +484,7 @@ def _parse_detail_json(raw_output: str, query: str) -> ClassificationResult:
         needs_search=True,
         intent_type=intent_type,
         filter_category=filter_category,
+        filter_categories=filter_categories,
         time_sensitivity=time_sensitivity,
         confidence=confidence,
         reference_datetime=reference_datetime,
@@ -433,6 +502,7 @@ def _rule_fallback_classify(query: str) -> ClassificationResult:
         needs_search=True,
         intent_type="realtime_quote" if time_sens == "realtime" else "news",
         filter_category=cat,
+        filter_categories=[cat],
         time_sensitivity=time_sens,
         confidence=0.5,
     )

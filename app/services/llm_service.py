@@ -33,7 +33,7 @@ def _parse_sse_content(line: str) -> Optional[str]:
 class LLMService:
     """LLM服务，调用GLM-4-Flash API"""
     
-    def __init__(self):
+    def __init__(self, local_llm_service=None):
         # 从Flask配置获取参数
         try:
             self.api_key = current_app.config.get('GLM_API_KEY', '')
@@ -46,6 +46,7 @@ class LLMService:
             self.model = 'glm-4-flash'
         
         self.client = httpx.Client(timeout=30.0)
+        self._local_llm = local_llm_service
     
     def chat(
         self,
@@ -239,15 +240,29 @@ class LLMService:
         return "\n".join(parts)
 
     @staticmethod
-    def _build_news_user_prompt(context_text: str, query: str) -> str:
-        """构建新闻回答的 user prompt（含回答要求 + 检索内容 + 用户问题）。"""
+    def _build_news_user_prompt(
+        context_text: str,
+        query: str,
+        coverage_note: str = "",
+        original_query: Optional[str] = None,
+        rewrite_reasoning: Optional[str] = None,
+    ) -> str:
+        """构建新闻回答的 user prompt（含回答要求 + 检索覆盖情况 + 检索内容 + 用户问题）。"""
         instruction = LLMService._build_news_answer_instruction()
+        coverage_block = f"\n{coverage_note}\n" if coverage_note else ""
+        grounding_block = ""
+        if original_query and original_query.strip() != query.strip():
+            grounding_block = (
+                f"你当前看到的参考资料是基于对原问题「{original_query}」的扩展搜索得来的，"
+                "请确保回答不偏离原问题核心。\n\n"
+            )
+        if rewrite_reasoning and rewrite_reasoning.strip():
+            grounding_block += f"改写说明：{rewrite_reasoning}\n\n"
         return f"""请严格遵循以下回答要求：
 
 {instruction}
-
----
-
+{grounding_block}---
+{coverage_block}
 以下是系统根据用户问题从新闻数据库中检索到的内容：
 
 {context_text}
@@ -260,6 +275,18 @@ class LLMService:
     _VAGUE_DATE_RE = re.compile(
         r'据最新报道|据报道(?!发布)|近日[，,]|最近[，,]|据悉[，,]'
     )
+
+    # ---- Markdown 加粗正则（纯规则，零延迟） ----
+    # 价格/金额：数字 + 可选万/亿 + 货币/重量单位 + 可选子单位
+    _MD_PRICE_RE = re.compile(
+        r'(\d[\d,]*(?:\.\d+)?\s*(?:万|亿)?\s*'
+        r'(?:美元|元|港元|日元|欧元|英镑|美分|吨|盎司|克|千克|桶|股)'
+        r'(?:/[^\s，。、；\n【】]+)?)'
+    )
+    # 百分比/涨跌幅
+    _MD_PCT_RE = re.compile(r'([+-±]?\d[\d,.]*%)')
+    # 体育比分（排除时间格式 HH:MM:SS）
+    _MD_SCORE_RE = re.compile(r'(?<![:\d])(\d{1,3}:\d{1,3})(?![:\d])')
 
     def _verify_answer(self, query: str, answer: str, context: List[Dict]) -> bool:
         """
@@ -301,6 +328,19 @@ class LLMService:
         except Exception as e:
             logger.warning(f"回答校验调用失败，视为通过: {e}")
             return True
+
+    def _format_to_markdown(self, answer: str) -> str:
+        """
+        纯文本 → Markdown 格式化（纯正则，零延迟，无截断风险）。
+        对价格/金额、百分比/涨跌幅、体育比分添加 **加粗**。
+        """
+        if not answer:
+            return answer
+        text = answer
+        text = self._MD_PRICE_RE.sub(r'**\1**', text)
+        text = self._MD_PCT_RE.sub(r'**\1**', text)
+        text = self._MD_SCORE_RE.sub(r'**\1**', text)
+        return text
 
     def _fix_date_formatting(self, answer: str, context: List[Dict]) -> str:
         """
@@ -351,6 +391,47 @@ class LLMService:
         except Exception as e:
             logger.warning(f"日期修正调用失败，返回原文: {e}")
             return answer
+
+    def decompose_query(self, standalone_query: str) -> List[str]:
+        """
+        将包含多个独立检索意图的查询分解为子查询。
+
+        单一意图（"黄金行情"）→ ["黄金行情"]
+        多意图  （"伦敦金和COMEX指标"）→ ["伦敦金指标", "COMEX指标"]
+
+        仅当查询包含并列连词时才调用 LLM 判断，否则直接返回原查询。
+        """
+        # 快速排除：不含并列连词 → 无需分解
+        if not any(conj in standalone_query for conj in ('和', '与', '以及', '、', '跟', '还有')):
+            return [standalone_query]
+
+        system_prompt = """你是查询分解助手。判断查询是否包含多个需要分别检索的独立主体，如果是则拆分。
+
+规则：
+1. "A和B"、"A、B"等并列结构中，A和B是不同检索主体时 → 拆分为独立子查询
+2. 复合概念不拆分："中美关系"是一个主题不拆；"进出口数据"不拆
+3. 每个子查询必须完整可独立检索（保留共享修饰词，如"行情""指标""最新"）
+4. 每行输出一个子查询，不编号不解释
+5. 不需要拆分时原样输出一行"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": standalone_query},
+        ]
+        try:
+            result = self.chat(messages, temperature=0.1, max_tokens=200)
+            if result:
+                sub_queries = [
+                    line.strip() for line in result.strip().split("\n") if line.strip()
+                ]
+                if sub_queries:
+                    if len(sub_queries) > 1:
+                        logger.info(
+                            f"查询分解: '{standalone_query}' -> {sub_queries}"
+                        )
+                    return sub_queries
+        except Exception as e:
+            logger.warning(f"查询分解失败: {e}")
+        return [standalone_query]
 
     def rewrite_query_for_search(self, user_query: str) -> str:
         """
@@ -432,16 +513,21 @@ class LLMService:
         self,
         query: str,
         context: List[Dict],
-        system_prompt: Optional[str] = None
+        system_prompt: Optional[str] = None,
+        coverage_note: str = "",
+        original_query: Optional[str] = None,
+        rewrite_reasoning: Optional[str] = None,
     ) -> str:
         """
         基于上下文生成回答
-        
+
         Args:
-            query: 用户问题
+            query: 用户问题（改写后的独立查询）
             context: 检索到的上下文（包含title, content, source, link等）
             system_prompt: 系统提示词
-            
+            coverage_note: 检索覆盖情况说明（多意图查询有缺失时由 pipeline 注入）
+            original_query: 用户原始问题（用于 Grounding Prompt）
+            rewrite_reasoning: 改写说明（若有）
         Returns:
             AI回答
         """
@@ -452,7 +538,11 @@ class LLMService:
         context_text = "\n\n".join(
             f"{i}. {self._format_news_item(item)}" for i, item in enumerate(context, 1)
         )
-        user_content = self._build_news_user_prompt(context_text, query)
+        user_content = self._build_news_user_prompt(
+            context_text, query, coverage_note,
+            original_query=original_query,
+            rewrite_reasoning=rewrite_reasoning,
+        )
         
         messages = [
             {"role": "system", "content": system_prompt},
@@ -465,6 +555,8 @@ class LLMService:
             return "根据当前检索到的内容无法可靠回答该问题，请稍后重试或换个问法。"
         # 2. 日期修正（仅在检测到模糊日期时调用）
         answer = self._fix_date_formatting(answer, context)
+        # 3. Markdown 格式化（独立后处理）
+        answer = self._format_to_markdown(answer)
         return answer
 
     def generate_answer_stream(
@@ -472,7 +564,10 @@ class LLMService:
         query: str,
         context: List[Dict],
         system_prompt: Optional[str] = None,
-        deep_think: bool = False
+        deep_think: bool = False,
+        coverage_note: str = "",
+        original_query: Optional[str] = None,
+        rewrite_reasoning: Optional[str] = None,
     ) -> Iterator[Dict]:
         """
         基于上下文流式生成回答，yield 的每个事件为可 JSON 序列化的 dict：
@@ -486,10 +581,14 @@ class LLMService:
         context_text = "\n\n".join(
             f"{i}. {self._format_news_item(item)}" for i, item in enumerate(context, 1)
         )
-        original_user_text = self._build_news_user_prompt(context_text, query)
+        original_user_text = self._build_news_user_prompt(
+            context_text, query, coverage_note,
+            original_query=original_query,
+            rewrite_reasoning=rewrite_reasoning,
+        )
         #《Prompt Repetition Improves Non-Reasoning LLMs》 (arXiv:2512.14982)
-        # 没想到吧, 真正的trick就是这么朴实无华
-        user_content = f"{original_user_text}\n\nRead again:\n{original_user_text}" 
+        # 完整重复 prompt：让第二遍的 token 可以 attend 到第一遍的所有上下文
+        user_content = f"{original_user_text}\n\nRead again:\n{original_user_text}"
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content}
@@ -505,10 +604,12 @@ class LLMService:
             yield {"replace": "根据当前检索到的内容无法可靠回答该问题，请稍后重试或换个问法。"}
             return
         # 2. 日期修正（仅在检测到模糊日期时调用）
-        fixed = self._fix_date_formatting(full_answer, context)
-        if fixed != full_answer:
-            logger.info("流式回答日期已修正")
-            yield {"replace": fixed}
+        answer = self._fix_date_formatting(full_answer, context)
+        # 3. Markdown 格式化（独立后处理）
+        answer = self._format_to_markdown(answer)
+        if answer != full_answer:
+            logger.info("流式回答已后处理（日期修正/Markdown格式化）")
+            yield {"replace": answer}
 
     def close(self):
         """关闭HTTP客户端"""

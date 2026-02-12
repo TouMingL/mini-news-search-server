@@ -87,6 +87,7 @@ class PipelineTracer:
         result: str,
         elapsed_ms: float,
         skipped: bool = False,
+        reasoning: Optional[str] = None,
     ):
         """[STEP 1] 查询改写 (Qwen)"""
         self._w(f"[STEP 1] 查询改写 (Qwen) | 耗时 {elapsed_ms:.1f}ms")
@@ -99,6 +100,8 @@ class PipelineTracer:
             self._w(prompt)
             self._w("<<< Qwen Output <<<")
             self._w(result)
+            if reasoning:
+                self._w(f"改写原因: {reasoning}")
         self._w()
 
     def record_classify(
@@ -136,24 +139,24 @@ class PipelineTracer:
         results: List[Dict[str, Any]],
         fallback_used: bool = False,
         anchor_date: Optional[Any] = None,
-        half_life_days: Optional[float] = None,
+        time_alpha: Optional[float] = None,
     ):
-        """[STEP 4] 检索结果（含新闻正文全文 + 时间衰减信息）"""
-        self._w(f"[STEP 4] 检索结果 | 共 {len(results)} 条 | fallback={fallback_used}")
+        """[STEP 4] 检索结果（含新闻正文全文 + RRF 时间重排信息）"""
+        self._w(f"[STEP 4] 检索结果 | 共 {len(results)} 条")
         self._w(self._SUB)
         self._w(f"检索查询: {search_queries}")
         if anchor_date is not None:
             anchor_str = anchor_date.strftime("%Y-%m-%d") if hasattr(anchor_date, "strftime") else str(anchor_date)
-            self._w(f"时间衰减: anchor_date={anchor_str}, half_life={half_life_days}d")
+            self._w(f"RRF 时间重排: anchor_date={anchor_str}, time_alpha={time_alpha}")
         self._w()
         for i, item in enumerate(results, 1):
             self._w(f"--- 第 {i} 条 ---")
             orig_score = item.get("original_score")
             tw = item.get("time_weight")
             if orig_score is not None:
-                self._w(f"  score          : {item.get('score', 0):.4f}  (semantic={orig_score:.4f} x time_weight={tw})")
+                self._w(f"  score          : {item.get('score', 0):.6f}  (sem={orig_score:.4f}, tw={tw})")
             else:
-                self._w(f"  score          : {item.get('score', 0):.4f}")
+                self._w(f"  score          : {item.get('score', 0):.6f}")
             self._w(f"  source         : {item.get('source', '')}")
             self._w(f"  title          : {item.get('title', '')}")
             self._w(f"  published_time : {item.get('published_time', '')}")
@@ -181,8 +184,19 @@ class PipelineTracer:
         self._w(user_prompt)
         self._w()
 
-    def record_glm_output(self, answer: str, verified: bool = True):
+    def record_glm_output(
+        self,
+        answer: str,
+        verified: bool = True,
+        raw_stream: Optional[str] = None,
+    ):
         """[STEP 5b] GLM 完整输出 + 核查结果"""
+        # 原始流输出（后处理前）
+        if raw_stream is not None and raw_stream != answer:
+            self._w("<<< GLM Raw Stream Output <<<")
+            self._w(raw_stream if raw_stream else "(空)")
+            self._w()
+        # 最终输出（后处理后）
         self._w("<<< GLM Output <<<")
         self._w(answer if answer else "(空)")
         self._w()

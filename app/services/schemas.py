@@ -32,7 +32,11 @@ class ClassificationResult(BaseModel):
     )
     filter_category: FILTER_CATEGORY = Field(
         default="general",
-        description="检索过滤类别，直接对应向量库 category，由 LLM 根据查询内容判断"
+        description="检索主类别（即 filter_categories 的第一项，兼容旧逻辑）"
+    )
+    filter_categories: List[FILTER_CATEGORY] = Field(
+        default_factory=list,
+        description="检索类别 top-k（最多 3 个），LLM 按相关度排序；检索时在此列表中匹配"
     )
     time_sensitivity: Literal["realtime", "recent", "historical", "none"] = Field(
         default="none",
@@ -229,6 +233,15 @@ class PipelineOutput(BaseModel):
     query_time: float = Field(
         description="总耗时（秒）"
     )
+
+
+# ============ 改写层输出 ============
+
+
+class RewriteResult(BaseModel):
+    """查询改写结果（含可选理由，供生成层与 tracer 使用）"""
+    standalone_query: str = Field(description="改写后的独立查询")
+    reasoning: Optional[str] = Field(default=None, description="改写原因（若有实质性改写）")
 
 
 # ============ 对话历史消息 ============

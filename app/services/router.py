@@ -8,7 +8,7 @@ import json
 import logging
 from datetime import date
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from loguru import logger
 
 from app.services.schemas import (
@@ -141,10 +141,12 @@ class Router:
                 inherited_from_state=True
             ))
 
-        # 是否继承上一轮 filter_category
+        # 是否继承上一轮 filter_category（主类用于状态；检索用 filter_categories）
         effective_filter_category = classification.filter_category
-        if self.state_manager.should_inherit_category(classification, state):
+        effective_filter_categories = getattr(classification, "filter_categories", None) or [classification.filter_category]
+        if self.state_manager.should_inherit_category(classification, state) and state.last_filter_category:
             effective_filter_category = state.last_filter_category
+            effective_filter_categories = [state.last_filter_category]
             logger.info(f"继承上轮 filter_category: {state.last_filter_category}")
 
         # ========== FSM 路由规则 ==========
@@ -163,11 +165,12 @@ class Router:
                 reason="常识问答，无需检索"
             ))
 
-        # 规则3：需要搜索 -> 向量检索后生成
+        # 规则3：需要搜索 -> 向量检索后生成（在前三类别 filter_categories 中搜）
         if classification.needs_search:
             search_params = self._build_search_params(
                 classification=classification,
                 effective_filter_category=effective_filter_category,
+                effective_filter_categories=effective_filter_categories,
                 standalone_query=standalone_query
             )
             return _log_and_return(RouteDecision(
@@ -182,6 +185,7 @@ class Router:
             search_params = self._build_search_params(
                 classification=classification,
                 effective_filter_category=effective_filter_category,
+                effective_filter_categories=effective_filter_categories,
                 standalone_query=standalone_query
             )
             return _log_and_return(RouteDecision(
@@ -203,6 +207,7 @@ class Router:
             search_params = self._build_search_params(
                 classification=classification,
                 effective_filter_category=effective_filter_category,
+                effective_filter_categories=effective_filter_categories,
                 standalone_query=standalone_query
             )
             return _log_and_return(RouteDecision(
@@ -221,17 +226,18 @@ class Router:
         self,
         classification: ClassificationResult,
         effective_filter_category: str,
-        standalone_query: str
+        standalone_query: str,
+        effective_filter_categories: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
-        构建检索参数
-        
-        filter_category 由 IntentClassifier 直接输出，无需映射
+        构建检索参数。使用 filter_categories（top3）在前三类别中检索；兼容 filter_category。
         """
         params: Dict[str, Any] = {
             "query": standalone_query,
             "filter_category": effective_filter_category
         }
+        if effective_filter_categories:
+            params["filter_categories"] = effective_filter_categories[:3]
         
         # 时效性推断日期范围
         from datetime import datetime, timedelta
