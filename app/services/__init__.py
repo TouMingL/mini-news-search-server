@@ -1,27 +1,11 @@
 # app/services/__init__.py
 # 服务层初始化模块
 """
-RAG服务层模块，提供：
+RAG 服务层：
 
-核心服务：
-- EmbeddingService: 文本向量化服务
-- VectorStore: 向量数据库操作服务
-- LLMService: LLM调用服务（GLM-4-Flash）
-- RAGService: RAG查询服务
-
-Pipeline组件（新架构）：
-- LocalLLMService: 本地LLM推理服务（Qwen2.5-3B）
-- QueryRewriter: 查询改写器（预处理层）
-- IntentClassifier: 意图分类器（分类层）
-- Router: 路由决策器（决策层）
-- SessionStateManager: 会话状态管理器
-- Pipeline: Pipeline编排器
-- PipelineLogger: Pipeline日志记录器
-
-数据模型：
-- schemas: Pydantic数据模型定义
-
-[已废弃] IntentService: 旧版意图判断服务（保留用于向后兼容）
+核心服务：EmbeddingService, VectorStore, LLMService, RAGService
+Pipeline：LocalLLMService, QueryRewriter, IntentClassifier, Router, SessionStateManager, Pipeline, PipelineLogger
+数据模型：schemas（Pydantic）
 """
 
 # 核心服务
@@ -50,9 +34,6 @@ from app.services.schemas import (
     HistoryMessage,
     LatencyMetrics
 )
-
-# 旧版服务（已废弃，保留用于向后兼容）
-from app.services.intent_service import IntentService
 
 __all__ = [
     # 核心服务
@@ -86,7 +67,4 @@ __all__ = [
     'PipelineOutput',
     'HistoryMessage',
     'LatencyMetrics',
-    
-    # 已废弃
-    'IntentService',
 ]

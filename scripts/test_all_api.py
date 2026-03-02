@@ -162,14 +162,7 @@ def main():
         auth=True
     )
 
-    # 4. RAG：意图 + 查询 + 信息（意图/查询需 JWT；info 无需）
-    add(
-        "POST /api/rag/intent",
-        "POST", "/api/rag/intent",
-        json_body={"query": "今天黄金价格多少", "history_turns": 0},
-        timeout=TIMEOUT_LONG,
-        auth=True
-    )
+    # 4. RAG：查询 + 信息（query 需 JWT；info 无需）
     add(
         "POST /api/rag/query",
         "POST", "/api/rag/query",

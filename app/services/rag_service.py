@@ -1,7 +1,6 @@
 # app/services/rag_service.py
 """
-RAG服务 - 整合检索和生成
-重构后支持 Pipeline 模式，同时保持旧接口兼容；支持流式输出。
+RAG服务 - 整合检索与生成；Pipeline 为推荐路径，支持多轮与流式。
 """
 import time
 from typing import List, Dict, Optional, Iterator
@@ -9,6 +8,7 @@ from loguru import logger
 
 from app.services.vector_store import VectorStore
 from app.services.llm_service import LLMService
+from app.services.answer_verifier import get_replacement_message
 
 
 class RAGService:
@@ -93,12 +93,21 @@ class RAGService:
                     "query_time": time.time() - start_time
                 }
 
-            # 3. LLM生成回答（使用原始问题 + 检索结果）
+            # 3. LLM生成回答（仅生成）
             logger.info("调用LLM生成回答")
             answer = self.llm_service.generate_answer(
                 query=query,
                 context=search_results
             )
+            result = self.pipeline.answer_verifier.verify(
+                query=query,
+                answer=answer,
+                context=search_results,
+            )
+            if not result.passed:
+                answer = get_replacement_message(result.failure_reason)
+            else:
+                answer = self.llm_service.post_process_answer(answer, search_results)
             
             # 4. 格式化来源信息（含 category）
             sources = [
@@ -210,29 +219,3 @@ class RAGService:
             filter_date_to=filter_date_to
         )
         yield from self.pipeline.run_stream(input_data)
-    
-    def check_intent_with_pipeline(
-        self,
-        query: str,
-        conversation_id: Optional[str] = None,
-        history_turns: int = 5,
-        current_date: Optional[str] = None
-    ) -> Dict:
-        """
-        使用 Pipeline 进行意图判断
-        
-        Args:
-            query: 用户查询
-            conversation_id: 对话ID
-            history_turns: 历史轮次
-            current_date: 当前日期
-            
-        Returns:
-            意图分析结果
-        """
-        return self.pipeline.intent_only(
-            query=query,
-            conversation_id=conversation_id,
-            history_turns=history_turns,
-            current_date=current_date
-        )
