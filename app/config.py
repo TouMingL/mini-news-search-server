@@ -73,6 +73,22 @@ class Config:
     # Pipeline配置
     PIPELINE_LOG_DIR = os.getenv('PIPELINE_LOG_DIR', 'logs/pipeline')
     PIPELINE_MAX_HISTORY_TURNS = int(os.getenv('PIPELINE_MAX_HISTORY_TURNS', 5))
+    # 直接生成时：当前 query 与上一轮对话的语义相关度低于此阈值则不带历史，仅用新消息回复
+    CONTEXT_RELEVANCE_THRESHOLD = float(os.getenv('CONTEXT_RELEVANCE_THRESHOLD', '0.45'))
+    # 检索结果语义分（original_score）低于此值的条目不参与生成，全部低于则返回「未检索到相关信息」
+    RETRIEVAL_MIN_SEMANTIC_SCORE = float(os.getenv('RETRIEVAL_MIN_SEMANTIC_SCORE', '0.4'))
+    # 检索排序时对「查询-文档字面重叠」的加分权重（0 表示关闭）。用于缓解纯向量检索忽略精确词匹配的问题，不依赖任何实体表
+    RETRIEVAL_TERM_OVERLAP_BOOST_WEIGHT = float(os.getenv('RETRIEVAL_TERM_OVERLAP_BOOST_WEIGHT', '0.12'))
+    # 混合检索（Dense + Sparse）：为 True 且 embedding 服务提供 sparse 且 collection 含 sparse 向量时，使用 RRF 融合
+    RETRIEVAL_HYBRID_ENABLED = os.getenv('RETRIEVAL_HYBRID_ENABLED', 'false').lower() in ('1', 'true', 'yes')
+    # 混合检索时 dense 向量在 Qdrant 中的名称；空表示单向量 collection（仅 dense），此时不做 hybrid
+    RETRIEVAL_DENSE_VECTOR_NAME = os.getenv('RETRIEVAL_DENSE_VECTOR_NAME', '')
+    # 混合检索时 sparse 向量在 Qdrant 中的名称
+    RETRIEVAL_SPARSE_VECTOR_NAME = os.getenv('RETRIEVAL_SPARSE_VECTOR_NAME', 'sparse')
+
+    # NBA 比分/详细数据：旧版单文件比分；新版按日期的 parsed_boxscore 目录（含节次、球员等）
+    NBA_SCORES_JSON_PATH = os.getenv('NBA_SCORES_JSON_PATH', '')
+    NBA_BOXSCORE_ROOT = os.getenv('NBA_BOXSCORE_ROOT', r'C:\Users\HX\Documents\KP\news-search\data\parsed_boxscore')
 
 
 class DevelopmentConfig(Config):
