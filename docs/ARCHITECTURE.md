@@ -258,8 +258,7 @@ LLM.generate_answer_stream()
 |------|------|----------------|
 | POST /api/chat | 统一对话入口 | 是 |
 | POST /api/conversations/{id}/messages | 消息落库同步 | 是（完成时） |
-| POST /api/rag/intent | 意图判断 | 否（仅供调试） |
-| POST /api/rag/query | RAG 查询 | 否（旧流程，保留兼容） |
+| POST /api/rag/query | RAG 查询（Pipeline） | 否（可选直连） |
 
 ---
 
