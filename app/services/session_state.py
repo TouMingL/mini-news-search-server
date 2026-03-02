@@ -51,7 +51,6 @@ class SessionStateManager:
         self,
         conversation_id: str,
         classification: ClassificationResult,
-        standalone_query: str,
         route_action: str
     ) -> SessionState:
         """
@@ -60,7 +59,6 @@ class SessionStateManager:
         Args:
             conversation_id: 对话ID
             classification: 本轮分类结果
-            standalone_query: 本轮独立查询
             route_action: 本轮路由动作
             
         Returns:
@@ -68,16 +66,10 @@ class SessionStateManager:
         """
         state = self.get_state(conversation_id)
         
-        # 更新 filter_category
-        state.last_filter_category = classification.filter_category
-        
-        # 更新独立查询
-        state.last_standalone_query = standalone_query
-        
-        # 更新路由
+        # 仅更新与「服务端处理历史」相关的字段；上轮类别以 pipeline 从当前请求 history 推断为准，不写此处（与删 Q&A 兼容）
         state.last_route = route_action
         
-        # 更新搜索计数
+        # 服务端连续检索计数（用户删上数轮 Q&A 后可能与用户可见轮次不一致）
         if route_action == "search_then_generate":
             state.search_count += 1
         else:
@@ -88,7 +80,7 @@ class SessionStateManager:
         
         logger.debug(
             f"更新会话状态: conversation={conversation_id}, "
-            f"filter_category={state.last_filter_category}, turn={state.turn_count}, "
+            f"route={state.last_route}, turn={state.turn_count}, "
             f"search_count={state.search_count}"
         )
         
@@ -128,50 +120,52 @@ class SessionStateManager:
     def should_inherit_category(
         self,
         current_classification: ClassificationResult,
-        state: SessionState
+        effective_last_category: Optional[str],
     ) -> bool:
         """
-        判断是否应该继承上一轮的 filter_category
-        
-        当当前分类置信度低且上一轮有明确类别时继承
+        判断是否应该继承上一轮的 filter_category。
+        与删数轮 Q&A 兼容：上轮类别由调用方从当前请求 history 推断传入，不读 state。
         """
-        # 置信度阈值
         CONFIDENCE_THRESHOLD = 0.6
-        
-        if not state.last_filter_category:
+        CONFIDENCE_FLOOR = 0.5
+
+        if not effective_last_category:
             return False
-        
+
+        if current_classification.confidence < CONFIDENCE_FLOOR:
+            return False
+
         if current_classification.confidence < CONFIDENCE_THRESHOLD:
             return True
-        
-        if current_classification.filter_category == "general" and state.last_filter_category != "general":
+
+        if (current_classification.filter_category == "general"
+            and effective_last_category != "general"):
             return True
-        
+
         return False
-    
+
     def detect_context_drift(
         self,
         current_classification: ClassificationResult,
-        state: SessionState
+        effective_last_category: Optional[str],
     ) -> bool:
         """
-        检测上下文漂移（主题突变）
-        
-        Returns:
-            True 表示检测到漂移，需要重置状态
+        检测上下文漂移（主题突变）。
+        与删数轮 Q&A 兼容：上轮类别由调用方从当前请求 history 推断传入，不读 state。
         """
-        if not state.last_filter_category:
+        if not effective_last_category:
             return False
-        
-        # 类别变化且置信度高 -> 漂移
-        if (current_classification.filter_category != state.last_filter_category and
-            current_classification.filter_category != "general" and
-            current_classification.confidence > 0.7):
+
+        if (current_classification.filter_category != effective_last_category
+            and current_classification.filter_category != "general"
+            and current_classification.confidence > 0.7):
             logger.info(
-                f"检测到上下文漂移: {state.last_filter_category} -> {current_classification.filter_category}"
+                "检测到上下文漂移: %s -> %s",
+                effective_last_category,
+                current_classification.filter_category,
             )
             return True
-        
+
         return False
     
     def is_search_loop(self, state: SessionState) -> bool:
