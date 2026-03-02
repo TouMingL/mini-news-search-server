@@ -1,7 +1,7 @@
 # app/services/router.py
 """
 决策层 - Router / Orchestrator
-职责：结合分类结果 + 会话状态，决定路由（FSM 状态机模式）
+职责：根据 RouteLLM 输出 + 会话状态，做保护逻辑与参数构建（无 FSM 分支）
 路由决策的详细日志仅写入 miniprogram-server/logs 下按天共用的 log 文件。
 """
 import json
@@ -12,11 +12,16 @@ from typing import Optional, Dict, Any, List
 from loguru import logger
 
 from app.services.schemas import (
-    ClassificationResult,
+    RouteLLMOutput,
     SessionState,
-    RouteDecision
+    RouteDecision,
+    TemporalContext,
+    TimeIntent,
+    classification_from_route_output,
+    _action_from_intent,
 )
 from app.services.session_state import SessionStateManager, get_session_state_manager
+from app.services.temporal_scope import compute_retrieval_scope
 
 
 # ---------- 路由层专用文件日志（仅写 logs 目录，按天共用，不输出到控制台） ----------
@@ -63,54 +68,52 @@ def _router_file_logger() -> logging.Logger:
     return log
 
 
-# 经济/财经类（用于实时行情规则）
-ECONOMY_FILTER_CATEGORY = "economy"
+def _is_meaningless_for_search(standalone_query: str) -> bool:
+    """检索用查询无效（无/空/过短）时返回 True，避免用无意义串做扩展检索。"""
+    if not standalone_query:
+        return True
+    s = standalone_query.strip()
+    if not s or s in ("无", "无。", "无，"):
+        return True
+    if len(s) <= 1:
+        return True
+    return False
 
 
 class Router:
     """
     路由决策器
-    基于 FSM（有限状态机）模式，结合分类结果和会话状态进行路由决策
+    基于 RouteLLM 输出做保护（无意义查询、搜索循环）与 search_params 构建，无 FSM 分支
     """
-    
+
     def __init__(self, state_manager: SessionStateManager = None):
-        """
-        初始化 Router
-        
-        Args:
-            state_manager: 会话状态管理器
-        """
         self._state_manager = state_manager
-    
+
     @property
     def state_manager(self) -> SessionStateManager:
-        """延迟获取状态管理器"""
         if self._state_manager is None:
             self._state_manager = get_session_state_manager()
         return self._state_manager
-    
+
     def decide(
         self,
-        classification: ClassificationResult,
+        route_llm_output: RouteLLMOutput,
         state: SessionState,
-        standalone_query: str
+        standalone_query: str,
+        temporal_context: Optional[TemporalContext] = None,
+        time_intent: Optional[TimeIntent] = None,
+        effective_last_category: Optional[str] = None,
     ) -> RouteDecision:
         """
-        根据分类结果和会话状态做出路由决策
-        
-        Args:
-            classification: 分类结果
-            state: 当前会话状态
-            standalone_query: 独立查询（用于构建检索参数）
-            
-        Returns:
-            RouteDecision 路由决策
+        根据 RouteLLM 输出和会话状态做出路由决策。
+        由 need_retrieval / need_scores 推导 action；无意义查询与搜索循环时覆盖为 generate_direct。
+        effective_last_category：上轮类别（由 pipeline 从当前请求 history 推断），用于上下文漂移判定，与删数轮 Q&A 兼容。
         """
         _router_log = _router_file_logger()
         _router_log.info(
             "======== 路由决策 输入 ========\n%s",
             json.dumps({
-                "classification": classification.model_dump(),
+                "route_llm_output": route_llm_output.model_dump(),
                 "state": state.model_dump(),
                 "standalone_query": standalone_query,
             }, ensure_ascii=False, indent=2)
@@ -127,170 +130,119 @@ class Router:
             )
             return decision
 
-        # 检测上下文漂移
-        if self.state_manager.detect_context_drift(classification, state):
+        # 无意义查询：若要走检索但查询无效，改为直接生成（仅覆盖决策 action，不改 route 输出）
+        need_retrieval = getattr(route_llm_output, "need_retrieval", False)
+        need_scores = getattr(route_llm_output, "need_scores", False)
+        if need_retrieval and _is_meaningless_for_search(standalone_query):
+            return _log_and_return(RouteDecision(
+                action="generate_direct",
+                reason="查询无效或无法理解，无法执行检索",
+            ))
+
+        action = _action_from_intent(need_retrieval, need_scores)
+
+        # 上下文漂移：当前类别与「当前请求 history 推断的上轮类别」不同且非 general 时重置连续搜索计数（不依赖 state，与删数轮 Q&A 兼容）
+        if (effective_last_category is not None
+            and route_llm_output.filter_category != effective_last_category
+            and route_llm_output.filter_category != "general"):
             logger.info("检测到上下文漂移，重置连续搜索计数")
             state.search_count = 0
 
-        # 检测搜索循环
+        # 搜索循环保护：基于服务端连续检索次数，用户删上数轮 Q&A 后与用户可见轮次可能不一致
         if self.state_manager.is_search_loop(state):
-            logger.warning(f"检测到搜索循环（连续{state.search_count}次），强制直接生成")
+            logger.warning("检测到搜索循环（连续%d次），强制直接生成", state.search_count)
             return _log_and_return(RouteDecision(
                 action="generate_direct",
                 reason=f"搜索循环保护：连续搜索{state.search_count}次",
                 inherited_from_state=True
             ))
 
-        # 是否继承上一轮 filter_category（主类用于状态；检索用 filter_categories）
-        effective_filter_category = classification.filter_category
-        effective_filter_categories = getattr(classification, "filter_categories", None) or [classification.filter_category]
-        if self.state_manager.should_inherit_category(classification, state) and state.last_filter_category:
-            effective_filter_category = state.last_filter_category
-            effective_filter_categories = [state.last_filter_category]
-            logger.info(f"继承上轮 filter_category: {state.last_filter_category}")
+        effective_filter_category = route_llm_output.filter_category
+        effective_filter_categories = [effective_filter_category]
 
-        # ========== FSM 路由规则 ==========
-
-        # 规则1：闲聊 -> 直接生成
-        if classification.intent_type == "chitchat":
+        if action == "tool_scores":
             return _log_and_return(RouteDecision(
-                action="generate_direct",
-                reason="闲聊类型，直接生成回复"
+                action="tool_scores",
+                tool_name="scores",
+                reason="赛况数据引擎(scores_only)：仅读本地 JSON，不检索不生成"
             ))
 
-        # 规则2：常识/知识 -> 直接生成
-        if classification.intent_type == "knowledge" and not classification.needs_search:
-            return _log_and_return(RouteDecision(
-                action="generate_direct",
-                reason="常识问答，无需检索"
-            ))
-
-        # 规则3：需要搜索 -> 向量检索后生成（在前三类别 filter_categories 中搜）
-        if classification.needs_search:
+        if action == "search_then_generate":
             search_params = self._build_search_params(
-                classification=classification,
+                route_llm_output=route_llm_output,
                 effective_filter_category=effective_filter_category,
                 effective_filter_categories=effective_filter_categories,
-                standalone_query=standalone_query
+                standalone_query=standalone_query,
+                temporal_context=temporal_context,
+                time_intent=time_intent,
             )
             return _log_and_return(RouteDecision(
                 action="search_then_generate",
                 search_params=search_params,
-                reason=f"需要检索: intent={classification.intent_type}, filter_category={effective_filter_category}"
+                reason=f"RouteLLM: 检索 filter_category={effective_filter_category}"
             ))
 
-        # 规则4：实时行情 + 经济类 -> 可扩展工具调用（当前降级为搜索）
-        if (classification.time_sensitivity == "realtime" and
-            effective_filter_category == ECONOMY_FILTER_CATEGORY):
-            search_params = self._build_search_params(
-                classification=classification,
-                effective_filter_category=effective_filter_category,
-                effective_filter_categories=effective_filter_categories,
-                standalone_query=standalone_query
-            )
-            return _log_and_return(RouteDecision(
-                action="search_then_generate",
-                search_params=search_params,
-                reason=f"实时行情查询（降级为搜索）: {effective_filter_category}"
-            ))
-
-        # 规则5：工具调用（天气等）-> 当前降级为直接生成
-        if classification.intent_type == "tool":
-            return _log_and_return(RouteDecision(
-                action="generate_direct",
-                tool_name="weather",
-                reason="天气查询（工具未实现，降级为直接生成）"
-            ))
-
-        # 规则6：Fallback -> 根据时效性决定
-        if classification.time_sensitivity in ("realtime", "recent"):
-            search_params = self._build_search_params(
-                classification=classification,
-                effective_filter_category=effective_filter_category,
-                effective_filter_categories=effective_filter_categories,
-                standalone_query=standalone_query
-            )
-            return _log_and_return(RouteDecision(
-                action="search_then_generate",
-                search_params=search_params,
-                reason=f"Fallback: 有时效性要求，执行检索 filter_category={effective_filter_category}"
-            ))
-
-        # 默认：直接生成
         return _log_and_return(RouteDecision(
             action="generate_direct",
-            reason="Fallback: 无明确检索需求"
+            reason="RouteLLM: 直接生成"
         ))
-    
+
     def _build_search_params(
         self,
-        classification: ClassificationResult,
+        route_llm_output: RouteLLMOutput,
         effective_filter_category: str,
         standalone_query: str,
         effective_filter_categories: Optional[List[str]] = None,
+        temporal_context: Optional[TemporalContext] = None,
+        time_intent: Optional[TimeIntent] = None,
     ) -> Dict[str, Any]:
-        """
-        构建检索参数。使用 filter_categories（top3）在前三类别中检索；兼容 filter_category。
-        """
+        """根据 RouteLLM 输出与时间上下文构建检索参数。时间部分由 temporal_scope 统一推导。"""
         params: Dict[str, Any] = {
             "query": standalone_query,
             "filter_category": effective_filter_category
         }
         if effective_filter_categories:
             params["filter_categories"] = effective_filter_categories[:3]
-        
-        # 时效性推断日期范围
-        from datetime import datetime, timedelta
-        today = datetime.now()
-        
-        if classification.time_sensitivity == "realtime":
-            # 实时：只查今天
-            params["filter_date_from"] = today.strftime("%Y-%m-%d")
-        elif classification.time_sensitivity == "recent":
-            # 近期：最近7天
-            params["filter_date_from"] = (today - timedelta(days=7)).strftime("%Y-%m-%d")
-        elif classification.time_sensitivity == "historical":
-            # 历史：最近30天（可根据具体日期调整）
-            params["filter_date_from"] = (today - timedelta(days=30)).strftime("%Y-%m-%d")
-        # none: 不限制日期
-        
-        # 传递时间衰减所需参数
-        params["time_sensitivity"] = classification.time_sensitivity
-        params["reference_datetime"] = classification.reference_datetime
-        
+
+        follow_up_type = getattr(route_llm_output, "follow_up_time_type", None)
+        retrieval_scope = compute_retrieval_scope(
+            temporal_context=temporal_context,
+            follow_up_type=follow_up_type,
+            time_intent=time_intent,
+            time_sensitivity=route_llm_output.time_sensitivity,
+        )
+        params.update(retrieval_scope)
         return params
-    
+
     def route_and_update_state(
         self,
-        classification: ClassificationResult,
+        route_llm_output: RouteLLMOutput,
+        route_decision: RouteDecision,
         conversation_id: str,
-        standalone_query: str
+        standalone_query: str,
+        temporal_context: Optional[TemporalContext] = None,
+        time_intent: Optional[TimeIntent] = None,
+        effective_last_category: Optional[str] = None,
     ) -> tuple[RouteDecision, SessionState]:
         """
-        路由决策并更新会话状态（便捷方法）
-        
-        Args:
-            classification: 分类结果
-            conversation_id: 对话ID
-            standalone_query: 独立查询
-            
-        Returns:
-            (RouteDecision, 更新后的SessionState)
+        一次完成：取 state -> decide -> 用 RouteLLM 输出更新 state。
+        与 decide() 一致：effective_last_category 由调用方从当前请求 history 推断传入，用于上下文漂移重置 search_count；未传则视为无上轮类别。
         """
-        # 获取状态
         state = self.state_manager.get_state(conversation_id)
-        
-        # 做出决策
-        decision = self.decide(classification, state, standalone_query)
-        
-        # 更新状态
+        decision = self.decide(
+            route_llm_output,
+            state,
+            standalone_query,
+            temporal_context=temporal_context,
+            time_intent=time_intent,
+            effective_last_category=effective_last_category,
+        )
+        classification = classification_from_route_output(route_llm_output)
         updated_state = self.state_manager.update_state(
             conversation_id=conversation_id,
             classification=classification,
-            standalone_query=standalone_query,
             route_action=decision.action
         )
-        
         return decision, updated_state
 
 
