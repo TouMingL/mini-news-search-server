@@ -2,6 +2,7 @@
 独立 Embedding 服务 - 单进程、只加载一次模型，供主服务通过 HTTP 调用。
 启动: python embedding_server.py
 环境变量: EMBEDDING_MODEL, EMBEDDING_DEVICE, EMBEDDING_BATCH_SIZE, EMBEDDING_SERVER_PORT
+混合检索: /embed_sparse 使用固定 BGE-M3 模型，需 pip install FlagEmbedding
 """
 import os
 import time
@@ -9,8 +10,13 @@ import time
 from dotenv import load_dotenv
 load_dotenv()
 
+# Sparse 向量模型（混合检索）：使用本地目录
+_SPARSE_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "bge-m3")
+SPARSE_MODEL_NAME = _SPARSE_MODEL_DIR
+
 # 在进程内只加载一次模型（模块级单例）
 _model = None
+_sparse_model = None
 _batch_size = 32
 
 
@@ -34,6 +40,34 @@ def _get_model():
         logger.warning("[EmbeddingServer] CUDA 不可用，使用 CPU")
     logger.info(f"[EmbeddingServer] 模型加载完成，batch_size={_batch_size}")
     return _model
+
+
+def _get_sparse_model():
+    """懒加载 BGE-M3 用于 sparse/lexical 向量（混合检索），从本地 models/bge-m3 加载，需先运行 scripts/download_bge_m3.py。"""
+    global _sparse_model
+    if _sparse_model is not None:
+        return _sparse_model
+    if not os.path.isdir(SPARSE_MODEL_NAME):
+        from loguru import logger
+        logger.warning(
+            f"[EmbeddingServer] Sparse 模型目录不存在: {SPARSE_MODEL_NAME}，请先运行: python scripts/download_bge_m3.py"
+        )
+        return None
+    try:
+        from loguru import logger
+        from FlagEmbedding import BGEM3FlagModel
+        logger.info(f"[EmbeddingServer] 正在加载 Sparse 模型（本地）: {SPARSE_MODEL_NAME}")
+        _sparse_model = BGEM3FlagModel(SPARSE_MODEL_NAME, use_fp16=True)
+        logger.info("[EmbeddingServer] Sparse 模型加载完成")
+        return _sparse_model
+    except ImportError as e:
+        from loguru import logger
+        logger.warning(f"[EmbeddingServer] Sparse 模型未安装或加载失败（需 pip install FlagEmbedding）: {e}")
+        return None
+    except Exception as e:
+        from loguru import logger
+        logger.warning(f"[EmbeddingServer] Sparse 模型加载失败: {e}")
+        return None
 
 
 def create_app():
@@ -76,6 +110,40 @@ def create_app():
         else:
             out = embeddings.tolist()
         return jsonify({"embeddings": out, "elapsed_ms": round(elapsed_ms, 2)})
+
+    @app.route('/embed_sparse', methods=['POST'])
+    def embed_sparse():
+        """返回 BGE-M3 等模型的 sparse（lexical）向量，用于混合检索。需设置 EMBEDDING_SPARSE_MODEL。"""
+        sparse_model = _get_sparse_model()
+        if sparse_model is None:
+            return jsonify({"error": "sparse model not available (install FlagEmbedding)"}), 501
+        body = request.get_json() or {}
+        texts = body.get('texts') or ([body['text']] if 'text' in body else [])
+        if not texts:
+            return jsonify({"error": "missing texts or text"}), 400
+        t0 = time.perf_counter()
+        out = sparse_model.encode(
+            texts,
+            return_dense=False,
+            return_sparse=True,
+            return_colbert_vecs=False,
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        lexical = out.get('lexical_weights') or []
+        sparse_list = []
+        for i in range(len(texts)):
+            if i < len(lexical):
+                lw = lexical[i]
+                if hasattr(lw, 'items'):
+                    pairs = list(lw.items())
+                    idx = [int(k) for k, _ in pairs]
+                    val = [float(v) for _, v in pairs]
+                else:
+                    idx, val = [], []
+            else:
+                idx, val = [], []
+            sparse_list.append({"indices": idx, "values": val})
+        return jsonify({"sparse": sparse_list, "elapsed_ms": round(elapsed_ms, 2)})
 
     @app.route('/health', methods=['GET'])
     def health():

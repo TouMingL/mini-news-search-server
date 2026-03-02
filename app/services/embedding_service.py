@@ -3,9 +3,10 @@
 Embedding 服务 - 通过 HTTP 调用独立 Embedding 进程，主进程不再加载模型。
 独立服务启动: python embedding_server.py（默认 0.0.0.0:8083）
 配置: EMBEDDING_SERVICE_URL（如 http://127.0.0.1:8083）
+混合检索时需服务端提供 /embed_sparse（如 BGE-M3 或 BM25），返回 sparse 向量 indices+values。
 """
 import time
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import requests
 from loguru import logger
@@ -96,6 +97,39 @@ class EmbeddingService:
             normalize_embeddings=normalize_embeddings,
             prompt_name="query",
         )
+
+    def encode_query_sparse(self, query_text: str) -> Optional[Tuple[List[int], List[float]]]:
+        """
+        对检索查询生成 sparse 向量（用于混合检索）。调用服务端 /embed_sparse。
+        Returns:
+            (indices, values) 或 None（服务未实现或调用失败时）
+        """
+        if not query_text or not str(query_text).strip():
+            return None
+        try:
+            base = self._get_base_url()
+            r = requests.post(
+                f"{base}/embed_sparse",
+                json={"texts": [query_text]},
+                timeout=self._timeout,
+            )
+            if r.status_code == 404 or r.status_code == 501:
+                return None
+            r.raise_for_status()
+            data = r.json()
+            sparse = data.get("sparse")
+            if not sparse or not isinstance(sparse, list) or len(sparse) == 0:
+                return None
+            # 单条: sparse[0] = {"indices": [...], "values": [...]}
+            first = sparse[0] if isinstance(sparse[0], dict) else sparse
+            indices = first.get("indices") or first.get("index") or []
+            values = first.get("values") or first.get("value") or []
+            if not indices or not values or len(indices) != len(values):
+                return None
+            return (list(indices), list(values))
+        except Exception as e:
+            logger.debug(f"[Embedding] encode_query_sparse 不可用或失败: {e}")
+            return None
 
     def get_embedding_dim(self) -> int:
         """获取向量维度（结果会缓存）。"""

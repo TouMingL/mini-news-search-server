@@ -15,5 +15,8 @@ pydantic>=2.0.0
 pydantic-settings>=2.0.0
 loguru>=0.7.0
 
+# 混合检索 Sparse（可选）：pip install FlagEmbedding 后设置 EMBEDDING_SPARSE_MODEL=BAAI/bge-m3 启用 /embed_sparse
+# FlagEmbedding
+
 # 注：本地LLM服务已移至 WSL vLLM，Windows 侧通过 HTTP 调用
 # vLLM 安装请参考 ~/llm-server/requirements.txt (WSL侧)
