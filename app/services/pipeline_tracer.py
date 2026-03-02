@@ -11,6 +11,8 @@ from typing import List, Dict, Any, Optional
 
 from loguru import logger
 
+from app.services.schemas import TemporalContext
+
 
 class PipelineTracer:
     """
@@ -81,6 +83,68 @@ class PipelineTracer:
             self._w("对话历史: (无)")
         self._w()
 
+    def record_temporal(self, temporal_context: TemporalContext):
+        """[STEP 0.5] 时间解析结果（当前句 query_time）"""
+        self._w("[STEP 0.5] 时间解析（当前句）")
+        self._w(self._SUB)
+        self._w(f"  reference_date : {temporal_context.reference_date or '(未解析)'}")
+        self._w(f"  date_range_from: {temporal_context.date_range_from or '-'}")
+        self._w(f"  date_range_to  : {temporal_context.date_range_to or '-'}")
+        self._w(f"  resolved       : {temporal_context.resolved}")
+        if getattr(temporal_context, "query_time", None) is not None:
+            self._w(f"  query_time     : {temporal_context.query_time}")
+        if getattr(temporal_context, "time_source", None) is not None:
+            self._w(f"  time_source    : {temporal_context.time_source}")
+        self._w()
+
+    def record_context_temporal(
+        self,
+        source: Optional[str],
+        temporal_context: Optional[Any],
+        last_turn_category: Optional[str],
+        follow_up_type: Optional[str] = None,
+    ):
+        """
+        [STEP 0.5b] 追问时间推断
+        follow_up_type: time_switch=用 query_time 不继承, event_continue/object_switch=继承 assistant_event_time
+        """
+        self._w("[STEP 0.5b] 追问时间推断")
+        self._w(self._SUB)
+        if follow_up_type:
+            self._w(f"  追问类型      : {follow_up_type}")
+        if follow_up_type == "time_switch":
+            self._w("  决策: 时间切换，使用 query_time，不继承 assistant_event_time")
+            if temporal_context:
+                self._w(f"  reference_date : {getattr(temporal_context, 'reference_date', None) or '-'}")
+                self._w(f"  query_time     : {getattr(temporal_context, 'query_time', None) or '-'}")
+        elif not last_turn_category or not source:
+            if last_turn_category:
+                self._w(f"  执行条件: 满足（追问 last_turn_category={last_turn_category}）")
+                self._w("  推断结果: 无（assistant 无日期，last_user 无时间词）")
+            else:
+                self._w("  执行条件: 未满足（非追问或 history 为空）")
+        else:
+            self._w(f"  执行条件: 满足（追问 last_turn_category={last_turn_category}）")
+            self._w(f"  time_source    : {source}")
+            self._w(f"  reference_date : {getattr(temporal_context, 'reference_date', None) or '-'}")
+            self._w(f"  date_range_from: {getattr(temporal_context, 'date_range_from', None) or '-'}")
+            self._w(f"  date_range_to  : {getattr(temporal_context, 'date_range_to', None) or '-'}")
+            if getattr(temporal_context, "event_time", None) is not None:
+                self._w(f"  event_time     : {temporal_context.event_time}")
+            if getattr(temporal_context, "inherited_event_time", None) is not None:
+                self._w(f"  inherited_event_time: {temporal_context.inherited_event_time}")
+        self._w()
+
+    def record_time_intent(self, time_intent: Any):
+        """[STEP 0.6] 时间意图分类结果（time_reference_type）"""
+        self._w("[STEP 0.6] 时间意图")
+        self._w(self._SUB)
+        ref_type = getattr(time_intent, "time_reference_type", time_intent) if time_intent else "(未调用)"
+        if isinstance(ref_type, dict):
+            ref_type = ref_type.get("time_reference_type", ref_type)
+        self._w(f"  time_reference_type : {ref_type}")
+        self._w()
+
     def record_rewrite(
         self,
         prompt: str,
@@ -89,8 +153,8 @@ class PipelineTracer:
         skipped: bool = False,
         reasoning: Optional[str] = None,
     ):
-        """[STEP 1] 查询改写 (Qwen)"""
-        self._w(f"[STEP 1] 查询改写 (Qwen) | 耗时 {elapsed_ms:.1f}ms")
+        """[STEP 2] 查询改写 (Qwen)"""
+        self._w(f"[STEP 2] 查询改写 (Qwen) | 耗时 {elapsed_ms:.1f}ms")
         self._w(self._SUB)
         if skipped:
             self._w("(跳过改写，原样返回)")
@@ -104,18 +168,19 @@ class PipelineTracer:
                 self._w(f"改写原因: {reasoning}")
         self._w()
 
-    def record_classify(
+    def record_route_llm(
         self,
-        prompt: str,
+        user_utterance: str,
+        last_filter_category: Optional[str],
         result_dict: Dict[str, Any],
         elapsed_ms: float,
     ):
-        """[STEP 2] 意图分类 (Qwen)"""
-        self._w(f"[STEP 2] 意图分类 (Qwen) | 耗时 {elapsed_ms:.1f}ms")
+        """[STEP 1] 路由小 LLM (Qwen)：仅输入用户句 + 上轮类别，输出 action/filter_category 等"""
+        self._w(f"[STEP 1] 路由小 LLM (Qwen) | 耗时 {elapsed_ms:.1f}ms")
         self._w(self._SUB)
-        self._w(">>> Qwen Prompt >>>")
-        self._w(prompt)
-        self._w("<<< Qwen Output <<<")
+        self._w(f"用户句: {user_utterance}")
+        self._w(f"上轮类别: {last_filter_category or '无'}")
+        self._w("<<< RouteLLM Output <<<")
         for k, v in result_dict.items():
             self._w(f"  {k}: {v}")
         self._w()
@@ -125,12 +190,27 @@ class PipelineTracer:
         action: str,
         reason: str,
         elapsed_ms: float,
+        search_params: Optional[Dict[str, Any]] = None,
     ):
-        """[STEP 3] 路由决策"""
+        """[STEP 3] 路由决策（含 search_params 时间参数：filter_date_from/to、reference_datetime、time_filter_strategy、answer_scope_date）"""
         self._w(f"[STEP 3] 路由决策 | 耗时 {elapsed_ms:.1f}ms")
         self._w(self._SUB)
         self._w(f"Action : {action}")
         self._w(f"Reason : {reason}")
+        if search_params:
+            self._w("search_params 时间参数:")
+            self._w(f"  filter_date_from   : {search_params.get('filter_date_from') or '-'}")
+            self._w(f"  filter_date_to     : {search_params.get('filter_date_to') or '-'}")
+            self._w(f"  reference_datetime : {search_params.get('reference_datetime') or '-'}")
+            self._w(f"  time_sensitivity   : {search_params.get('time_sensitivity') or '-'}")
+            if search_params.get("answer_scope_date") is not None:
+                self._w(f"  answer_scope_date : {search_params.get('answer_scope_date')}")
+            if search_params.get("time_filter_strategy"):
+                self._w(f"  time_filter_strategy : {search_params['time_filter_strategy']}")
+            if search_params.get("filter_event_time_from") is not None:
+                self._w(f"  filter_event_time_from: {search_params.get('filter_event_time_from')}")
+            if search_params.get("filter_event_time_to") is not None:
+                self._w(f"  filter_event_time_to  : {search_params.get('filter_event_time_to')}")
         self._w()
 
     def record_search(
@@ -140,10 +220,20 @@ class PipelineTracer:
         fallback_used: bool = False,
         anchor_date: Optional[Any] = None,
         time_alpha: Optional[float] = None,
+        retrieval_mode: Optional[str] = None,
+        filter_date_from: Optional[str] = None,
+        filter_date_to: Optional[str] = None,
+        reference_date: Optional[str] = None,
     ):
-        """[STEP 4] 检索结果（含新闻正文全文 + RRF 时间重排信息）"""
+        """[STEP 4] 检索结果（含时间参数、RRF 时间重排、正文全文）"""
         self._w(f"[STEP 4] 检索结果 | 共 {len(results)} 条")
         self._w(self._SUB)
+        self._w("检索时间参数（传入向量库/检索层）:")
+        self._w(f"  filter_date_from : {filter_date_from or '-'}")
+        self._w(f"  filter_date_to   : {filter_date_to or '-'}")
+        self._w(f"  reference_date   : {reference_date or '-'}")
+        if retrieval_mode:
+            self._w(f"检索模式: {retrieval_mode}")
         self._w(f"检索查询: {search_queries}")
         if anchor_date is not None:
             anchor_str = anchor_date.strftime("%Y-%m-%d") if hasattr(anchor_date, "strftime") else str(anchor_date)
@@ -189,8 +279,12 @@ class PipelineTracer:
         answer: str,
         verified: bool = True,
         raw_stream: Optional[str] = None,
+        failure_reason: Optional[Any] = None,
+        evidence_ok: Optional[bool] = None,
+        time_consistency_ok: Optional[bool] = None,
+        verification_result: Optional[Any] = None,
     ):
-        """[STEP 5b] GLM 完整输出 + 核查结果"""
+        """[STEP 5b] GLM 完整输出 + 核查结果（verified/failure_reason 由 Pipeline 统一传入）；若提供 verification_result 则按先前格式写入捏造/扣题/时间对齐及耗时。"""
         # 原始流输出（后处理前）
         if raw_stream is not None and raw_stream != answer:
             self._w("<<< GLM Raw Stream Output <<<")
@@ -200,7 +294,28 @@ class PipelineTracer:
         self._w("<<< GLM Output <<<")
         self._w(answer if answer else "(空)")
         self._w()
-        self._w(f"事实核查通过: {'YES' if verified else 'NO (已替换为保守回复)'}")
+        # 事实核查明细（与 log 一致格式 + 耗时）
+        if verification_result is not None:
+            fab_ms = getattr(verification_result, "fabrication_ms", None)
+            on_ms = getattr(verification_result, "on_topic_ms", None)
+            tem_ms = getattr(verification_result, "temporal_ms", None)
+            reason = getattr(verification_result, "failure_reason", None)
+            reason_val = getattr(reason, "value", None) or str(reason) if reason else None
+            if fab_ms is not None:
+                self._w(f"事实核查-捏造: {'不通过' if reason_val == 'fabrication' else '通过'} | 耗时 {fab_ms:.1f}ms")
+            if on_ms is not None:
+                self._w(f"事实核查-答非所问: {'不通过' if reason_val == 'off_topic' else '通过'} | 耗时 {on_ms:.1f}ms")
+            if tem_ms is not None:
+                self._w(f"事实核查-时间对齐: {'不通过' if reason_val == 'time_consistency' else '通过'} | 耗时 {tem_ms:.1f}ms")
+        if verified:
+            self._w("事实核查通过: YES")
+        else:
+            reason_str = (getattr(failure_reason, "value", None) or str(failure_reason)) if failure_reason else "unknown"
+            self._w(f"事实核查通过: NO (已替换为保守回复) | 原因: {reason_str}")
+        if evidence_ok is not None:
+            self._w(f"时间证据校验: {'有' if evidence_ok else '无（已拒答）'}")
+        if time_consistency_ok is not None:
+            self._w(f"回答日期一致性: {'通过' if time_consistency_ok else '不通过'}")
         self._w()
 
     def record_direct_generate(

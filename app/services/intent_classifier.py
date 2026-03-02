@@ -42,6 +42,41 @@ _KNOWLEDGE_PATTERNS = [
     '好不好', '牛不牛', '厉不厉害', '值不值', '推荐吗', '怎么样',
     '是真的吗', '对不对', '有什么用',
 ]
+# 弱放行阻断：含这些词视为明确知识问句，不触发「有时效词即放行」。不含「怎么样」「如何」，以便「XX最近打得怎么样」可弱放行
+_KNOWLEDGE_BLOCK_FOR_WEAK_PASS = (
+    '什么是', '是什么', '怎么理解', '原理', '定义', '区别是',
+    '为什么', '怎么做', '怎么用', '能不能', '可以吗',
+    '帮我算', '计算', '等于多少',
+    '好不好', '牛不牛', '厉不厉害', '值不值', '推荐吗',
+    '是真的吗', '对不对', '有什么用',
+)
+
+# 体育检索且用户问法涉及比分/赛果/表现时，执行层将附带赛况数据引擎；分类层基于原始 query 判定
+# 含「打得/打的」两种常见写法，避免「打的如何」漏挂赛况数据引擎
+_SCORE_SEEKING_KEYWORDS = (
+    "比分", "得分", "赛果", "战况", "几比几", "胜负", "赢了", "输了", "领先", "落后",
+    "今日赛况", "昨日赛果", "比赛结果", "最新赛果",
+    "打得怎么样", "打得如何", "打得怎样", "打的怎么样", "打的如何", "打的怎样",
+    "结果如何", "赢了吗", "输了吗", "多少分", "情况如何", "比赛情况", "近况", "赛况",
+)
+
+# 用户明确只要新闻或明确不要赛况/比分时，不得挂赛况数据引擎（优先于 _SCORE_SEEKING_KEYWORDS）
+_SCORE_REJECTING_PATTERNS = (
+    "不要赛况", "不要比分", "不要赛果", "不用赛况", "无需赛况", "仅要新闻", "只要新闻",
+    "只要资讯", "仅新闻", "新闻就行", "新闻即可", "有没有新闻", "有什么新闻", "要新闻",
+)
+
+
+def _query_rejects_scores(lower: str) -> bool:
+    """用户是否明确只要新闻或明确不要赛况/比分；是则不应 need_scores。"""
+    return bool(lower and any(pat in lower for pat in _SCORE_REJECTING_PATTERNS))
+
+
+def _query_seeks_scores(lower: str) -> bool:
+    """原始 query 是否涉及比分/赛果/表现（用于设置 need_scores）。用户明确排除赛况时返回 False。"""
+    if not lower or _query_rejects_scores(lower):
+        return False
+    return any(kw in lower for kw in _SCORE_SEEKING_KEYWORDS)
 
 # 乱码检测：非中日韩字符 + 非常见英文字母组合
 _GIBBERISH_RE = re.compile(
@@ -52,10 +87,41 @@ _COMMON_ENGLISH = re.compile(
     re.IGNORECASE,
 )
 
+
+def _is_scores_tool_query(lower: str) -> bool:
+    """含「比分」且与 NBA/比赛 相关时走赛况数据引擎，不检索，从根源上杜绝幻觉。"""
+    if "比分" not in lower:
+        return False
+    return any(
+        kw in lower for kw in ("nba", "比赛", "今日", "昨天", "战况", "赛果", "篮球")
+    )
+
+
+def _is_short_mixed_or_meaningless(query: str) -> bool:
+    """
+    短句且混合 CJK/ASCII 或无任何领域/时效信号，视为无意义，避免高置信度走检索。
+    例如：「分为fwe」「a啊b」等。
+    """
+    stripped = query.strip()
+    if len(stripped) > 6:
+        return False
+    lower = stripped.lower()
+    has_timeliness = any(kw in lower for kw in _TIMELINESS_KEYWORDS)
+    matched_cat = _match_category(lower)
+    if has_timeliness or matched_cat:
+        return False
+    has_cjk = bool(re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', stripped))
+    has_non_cjk = bool(re.search(r'[a-zA-Z0-9]', stripped))
+    if has_cjk and has_non_cjk:
+        return True
+    if len(stripped) <= 3 and re.match(r'^[a-zA-Z0-9\s\W]+$', stripped):
+        return True
+    return False
+
 # 时效性强信号词 → 几乎一定需要搜索
 _TIMELINESS_KEYWORDS = (
     '新闻', '快讯', '最新', '最近', '今天', '今日', '昨天', '本周',
-    '近期', '刚刚', '突发', '实时', '行情', '走势', '涨了', '跌了',
+    '近期', '近况', '刚刚', '突发', '实时', '行情', '走势', '涨了', '跌了',
     '多少钱', '现在价格', '当前',
 )
 
@@ -71,8 +137,9 @@ _CATEGORY_KEYWORDS = {
     "tech": ['ai', '芯片', '互联网', '手机', '数码', '科技', '大模型', '机器人', '半导体'],
     "sports": [
         '足球', '篮球', '奥运', '羽毛球', '网球', '乒乓球',
-        '体育', '赛事', 'nba', 'cba', '世界杯', '欧冠', '英超',
-        '转会', '比分', '联赛',
+        '体育', '赛事', '比赛', 'nba', 'cba', '火箭', '湖人', '勇士', '杜兰特', '詹姆斯',
+        '马刺', '凯尔特人', '热火', '独行侠', '太阳', '掘金', '快船', '雄鹿', '76人', '尼克斯',
+        '世界杯', '欧冠', '英超', '转会', '比分', '联赛',
     ],
     "world": ['中美', '俄乌', '地缘', '国际', '政治', '外交', '制裁', '关税'],
     "health": ['健康', '医药', '养生', '新药', '疫苗', '疫情'],
@@ -163,6 +230,7 @@ class IntentClassifier:
         current_date: Optional[str] = None,
         history: Optional[List[HistoryMessage]] = None,
         original_query: Optional[str] = None,
+        reference_date: Optional[str] = None,
     ) -> ClassificationResult:
         if current_date is None:
             current_date = datetime.now().strftime("%Y-%m-%d")
@@ -176,6 +244,8 @@ class IntentClassifier:
                 f"[Classifier] 规则前置命中: needs_search={rule_result.needs_search}, "
                 f"intent={rule_result.intent_type}, reason=rule"
             )
+            if reference_date and rule_result.reference_datetime is None:
+                rule_result = rule_result.model_copy(update={"reference_datetime": reference_date})
             return rule_result
 
         # ===== Layer 1: needs_search 二分类 (LLM) =====
@@ -183,18 +253,26 @@ class IntentClassifier:
 
         if not needs_search:
             logger.info(f"[Classifier] LLM 判定不需要检索: {query}")
-            return ClassificationResult(
+            result = ClassificationResult(
                 needs_search=False,
+                need_retrieval=False,
+                need_scores=False,
                 intent_type="knowledge",
                 filter_category="general",
                 filter_categories=["general"],
                 time_sensitivity="none",
                 confidence=0.8,
             )
+            if reference_date:
+                result = result.model_copy(update={"reference_datetime": reference_date})
+            return result
 
         # ===== Layer 2: 细分类 (LLM) =====
         logger.info(f"[Classifier] 需要检索，进入细分类: {query}")
-        return self._llm_detail_classify(query, current_date)
+        result = self._llm_detail_classify(query, current_date)
+        if reference_date and result.reference_datetime is None:
+            result = result.model_copy(update={"reference_datetime": reference_date})
+        return result
 
     # ------------------------------------------------------------------
     # Layer 0: 规则前置
@@ -204,35 +282,35 @@ class IntentClassifier:
     def _rule_pre_filter(query: str) -> Optional[ClassificationResult]:
         """
         纯规则判断。能确定时返回 ClassificationResult，不确定返回 None 交给 LLM。
+
+        顺序原则：时效+领域、新闻/快讯 优先于 知识模式。否则「最近XX怎么样」会先命中
+        「怎么样」被判为常识，导致第一步就歪。
         """
         lower = query.lower().strip()
 
         # 1. 精确匹配闲聊
         if lower in _CHITCHAT_EXACT:
             return ClassificationResult(
-                needs_search=False, intent_type="chitchat",
+                needs_search=False, need_retrieval=False, need_scores=False,
+                intent_type="chitchat",
                 filter_category="general", filter_categories=["general"],
-                time_sensitivity="none", confidence=0.95,
+                time_sensitivity="none",                 confidence=0.95,
             )
 
-        # 2. 知识 / 主观评价模式
-        for pat in _KNOWLEDGE_PATTERNS:
-            if pat in lower:
-                return ClassificationResult(
-                    needs_search=False, intent_type="knowledge",
-                    filter_category="general", filter_categories=["general"],
-                    time_sensitivity="none", confidence=0.85,
-                )
-
-        # 3. 疑似乱码（纯 ASCII 且不含常见英文词）
-        if _GIBBERISH_RE.match(query) and not _COMMON_ENGLISH.search(query):
+        # 1.5 赛况数据引擎(scores_only)：NBA/比赛 比分 → 仅读 JSON，不检索、不生成
+        if _is_scores_tool_query(lower):
             return ClassificationResult(
-                needs_search=False, intent_type="chitchat",
-                filter_category="general", filter_categories=["general"],
-                time_sensitivity="none", confidence=0.9,
+                needs_search=False,
+                need_retrieval=False,
+                need_scores=True,
+                intent_type="tool_scores",
+                filter_category="sports",
+                filter_categories=["sports"],
+                time_sensitivity="none",
+                confidence=0.95,
             )
 
-        # 4. 强时效性信号 + 领域关键词 → 直接放行搜索
+        # 2. 强时效性信号 + 领域关键词 → 直接放行搜索
         has_timeliness = any(kw in lower for kw in _TIMELINESS_KEYWORDS)
         matched_cat = _match_category(lower)
         if has_timeliness and matched_cat:
@@ -241,6 +319,8 @@ class IntentClassifier:
             ) else "recent"
             return ClassificationResult(
                 needs_search=True,
+                need_retrieval=True,
+                need_scores=(matched_cat == "sports" and _query_seeks_scores(lower)),
                 intent_type="realtime_quote" if time_sens == "realtime" else "news",
                 filter_category=matched_cat,
                 filter_categories=[matched_cat],
@@ -248,15 +328,78 @@ class IntentClassifier:
                 confidence=0.9,
             )
 
-        # 5. 含"新闻"/"快讯"等明确搜索意图词
+        # 3. 含"新闻"/"快讯"等明确搜索意图词
         if any(kw in lower for kw in ('新闻', '快讯', '头条', '突发')):
             return ClassificationResult(
                 needs_search=True,
+                need_retrieval=True,
+                need_scores=((matched_cat or "general") == "sports" and _query_seeks_scores(lower)),
                 intent_type="news",
                 filter_category=matched_cat or "general",
                 filter_categories=[matched_cat] if matched_cat else ["general"],
                 time_sensitivity="recent",
                 confidence=0.9,
+            )
+
+        # 3.5 弱放行：有时效词 且 无明确知识问句
+        if has_timeliness and not any(pat in lower for pat in _KNOWLEDGE_BLOCK_FOR_WEAK_PASS):
+            time_sens = "realtime" if any(
+                kw in lower for kw in ('今天', '今日', '实时', '当前', '现在', '多少钱', '现在价格')
+            ) else "recent"
+            return ClassificationResult(
+                needs_search=True,
+                need_retrieval=True,
+                need_scores=((matched_cat or "general") == "sports" and _query_seeks_scores(lower)),
+                intent_type="realtime_quote" if time_sens == "realtime" else "news",
+                filter_category=matched_cat or "general",
+                filter_categories=[matched_cat] if matched_cat else ["general"],
+                time_sensitivity=time_sens,
+                confidence=0.85,
+            )
+
+        # 3.6 体育主体 + 表现/近况类问法（无时效词时）
+        _SPORTS_PERFORMANCE_PATTERNS = (
+            '打得怎么样', '打得如何', '打得怎样', '打的怎么样', '打的如何', '打的怎样',
+            '近况', '赛况', '比赛结果',
+        )
+        if matched_cat == "sports" and any(pat in lower for pat in _SPORTS_PERFORMANCE_PATTERNS):
+            return ClassificationResult(
+                needs_search=True,
+                need_retrieval=True,
+                need_scores=_query_seeks_scores(lower),
+                intent_type="news",
+                filter_category="sports",
+                filter_categories=["sports"],
+                time_sensitivity="recent",
+                confidence=0.9,
+            )
+
+        # 4. 知识 / 主观评价模式（在时效/检索之后，避免「最近XX怎么样」被误判）
+        for pat in _KNOWLEDGE_PATTERNS:
+            if pat in lower:
+                return ClassificationResult(
+                    needs_search=False, need_retrieval=False, need_scores=False,
+                    intent_type="knowledge",
+                    filter_category="general", filter_categories=["general"],
+                    time_sensitivity="none", confidence=0.85,
+                )
+
+        # 5. 疑似乱码（纯 ASCII 且不含常见英文词）
+        if _GIBBERISH_RE.match(query) and not _COMMON_ENGLISH.search(query):
+            return ClassificationResult(
+                needs_search=False, need_retrieval=False, need_scores=False,
+                intent_type="chitchat",
+                filter_category="general", filter_categories=["general"],
+                time_sensitivity="none", confidence=0.9,
+            )
+
+        # 5.5 短句混合/无意义（如「分为fwe」）：无领域信号则不走检索
+        if _is_short_mixed_or_meaningless(query):
+            return ClassificationResult(
+                needs_search=False, need_retrieval=False, need_scores=False,
+                intent_type="chitchat",
+                filter_category="general", filter_categories=["general"],
+                time_sensitivity="none", confidence=0.0,
             )
 
         # 不确定 → 交给 LLM
@@ -400,8 +543,11 @@ def _to_classification(detail: _DetailClassifyResult, query: str = "") -> Classi
     """将 Stage 2 结果转为完整 ClassificationResult（needs_search=True）。"""
     cats = _normalize_categories(detail.filter_categories, query)
     primary = cats[0] if cats else "general"
+    lower = (query or "").strip().lower()
     return ClassificationResult(
         needs_search=True,
+        need_retrieval=True,
+        need_scores=("sports" in cats and _query_seeks_scores(lower)),
         intent_type=detail.intent_type,
         filter_category=primary,
         filter_categories=cats,
@@ -482,6 +628,8 @@ def _parse_detail_json(raw_output: str, query: str) -> ClassificationResult:
 
     return ClassificationResult(
         needs_search=True,
+        need_retrieval=True,
+        need_scores=("sports" in filter_categories and _query_seeks_scores((query or "").lower())),
         intent_type=intent_type,
         filter_category=filter_category,
         filter_categories=filter_categories,
@@ -500,6 +648,8 @@ def _rule_fallback_classify(query: str) -> ClassificationResult:
     ) else "recent"
     return ClassificationResult(
         needs_search=True,
+        need_retrieval=True,
+        need_scores=(cat == "sports" and _query_seeks_scores(lower)),
         intent_type="realtime_quote" if time_sens == "realtime" else "news",
         filter_category=cat,
         filter_categories=[cat],

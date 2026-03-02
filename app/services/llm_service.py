@@ -5,6 +5,7 @@ LLM服务 - GLM-4-Flash API调用
 """
 import json
 import re
+from datetime import datetime
 import httpx
 from typing import List, Dict, Optional, Iterator
 from loguru import logger
@@ -162,8 +163,8 @@ class LLMService:
 
 ## 日期规范（最高优先级）
 检索结果中有两种日期，用途完全不同：
-- **报道发布时间**（标注在每条新闻的「报道发布时间」字段）：仅供你内部做事实校验和时效排序，**不得直接作为事件发生日期告诉用户**。
-- **事件发生日期**（从新闻正文中提取）：这才是你要播报给用户的日期。
+- **报道时间**（published_time）：每条新闻的「报道发布时间」字段，表示稿件发布时间，仅供内部校验和时效排序，**不得直接作为事件发生日期告诉用户**。
+- **事件时间**（event_time）：新闻描述的事实发生日期，从正文提取；赛况数据引擎中的 date 字段为事件时间。用户问「昨天/前天」时，应以**事件时间**为准作答；赛况数据引擎有对应日期数据时优先使用。
 
 播报时的日期标注规则：
 1. **优先从正文提取事件日期**：如正文写了"2月6日交易截止日"，则播报时使用"2026年2月6日"。
@@ -180,6 +181,8 @@ class LLMService:
 - 检索到多条相关新闻时，逐条独立播报，每条标注对应【媒体名】，禁止交叉整合；
 - 新闻中仅含部分核心信息、不完整时，直接播报现有信息 + 【媒体名】标注，禁止从其他新闻提取信息补充；
 - 不同新闻中出现同一事件的矛盾信息（如同一时间 + 同一对阵双方的不同比分、同一时间 + 同一品种的不同价格），直接舍弃该事件所有信息，按规则 5 说明未检索到相关信息；
+- 若提供的检索结果中包含「来源：赛况数据引擎」的比分数据，且其中已有用户所问主体（如某球队）的比赛/比分信息，则仅根据该条作答即可，不得再追加与首条并列的「未检索到…」「未检索到关于XX其他…」等说明；仅在整份检索结果中均无与用户所问条件直接相关的内容时，才输出一句规则 5 规定的「未检索到相关信息」；
+- **赛况优先**：赛况数据引擎的比分优先于检索片段；若 context 里已有「来源：赛况数据引擎」的比分，禁止用检索到的新闻内容编造或改写比分数字，仅可转述赛况数据中的内容；
 - 无任何相关信息时，仅输出规则 5 规定的标准表述，无其他多余内容。"""
 
     @staticmethod
@@ -246,8 +249,11 @@ class LLMService:
         coverage_note: str = "",
         original_query: Optional[str] = None,
         rewrite_reasoning: Optional[str] = None,
+        detail_follow_up: bool = False,
+        reference_date: Optional[str] = None,
+        current_date: Optional[str] = None,
     ) -> str:
-        """构建新闻回答的 user prompt（含回答要求 + 检索覆盖情况 + 检索内容 + 用户问题）。"""
+        """构建新闻回答的 user prompt（含回答要求 + 检索覆盖情况 + 检索内容 + 用户问题）。reference_date 为回答范围日期（answer_scope_date），有值时才注入「目标日期」约束。"""
         instruction = LLMService._build_news_answer_instruction()
         coverage_block = f"\n{coverage_note}\n" if coverage_note else ""
         grounding_block = ""
@@ -258,10 +264,32 @@ class LLMService:
             )
         if rewrite_reasoning and rewrite_reasoning.strip():
             grounding_block += f"改写说明：{rewrite_reasoning}\n\n"
+        if detail_follow_up:
+            grounding_block += (
+                "用户当前为追问细节，请完整呈现检索内容中的比分、节次与球员数据，不要概括压缩；"
+                "新闻稿可依长度适度概括或原样输出。\n\n"
+            )
+        date_constraint = ""
+        if reference_date and current_date:
+            try:
+                ref_dt = datetime.strptime(reference_date.strip()[:10], "%Y-%m-%d")
+                ref_ymd = f"{ref_dt.year}年{ref_dt.month}月{ref_dt.day}日"
+                date_constraint = (
+                    "## 日期约束（最高优先级）\n"
+                    f"本问题询问的是「刚结束/今天」等时间范围，目标日期为 **{ref_ymd}**。\n"
+                    "- 你**仅可播报事件发生日期等于该日的新闻**。正文中的「报道发布时间」不是事件发生日期；事件发生日期以正文内「X月X日讯」「X月X日」等为准。\n"
+                    "- 播报时**必须在回答中明确写出事件日期**（如「YYYY年M月D日」）；若目标日即为今日，可写「今天」且仅当该事件确为今日发生时。\n"
+                    "- **禁止**用「刚刚」「刚结束」等模糊词指代非当日的旧闻；若检索结果中无该日期的比赛/事件，应明确说明「该日暂无」或「目前没有该日已结束的场次」等。\n"
+                )
+                if "进行中" in context_text:
+                    date_constraint += "- 若检索内容中某场比赛标注为「进行中」，则回答中对该场**仅可写当前比分与领先方**，**不得**使用「获胜」「击败」「取胜」「险胜」等表示已结束的措辞。\n"
+                date_constraint += "\n"
+            except ValueError:
+                pass
         return f"""请严格遵循以下回答要求：
 
 {instruction}
-{grounding_block}---
+{date_constraint}{grounding_block}---
 {coverage_block}
 以下是系统根据用户问题从新闻数据库中检索到的内容：
 
@@ -288,46 +316,118 @@ class LLMService:
     # 体育比分（排除时间格式 HH:MM:SS）
     _MD_SCORE_RE = re.compile(r'(?<![:\d])(\d{1,3}:\d{1,3})(?![:\d])')
 
-    def _verify_answer(self, query: str, answer: str, context: List[Dict]) -> bool:
-        """
-        捏造检测（单一职责，短 prompt，只返回 bool）。
+    # ---- 时间证据与一致性（reference_date 明确时） ----
+    # 回答中事件日期抽取：YYYY年M月D日、YYYY-M-D、M月D日等
+    _ANSWER_DATE_RE = re.compile(
+        r'(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日|(\d{4})-(\d{1,2})-(\d{1,2})'
+    )
 
-        拦截：回答中出现了检索结果中完全不存在的新闻事实、数据、来源名称。
-        放行：其他所有情况。
-        """
-        lines = []
-        for i, item in enumerate(context, 1):
-            src = item.get("source", "")
-            title = item.get("title", "")
-            content = (item.get("content") or "")[:300]
-            lines.append(f"{i}. 来源：{src} 标题：{title} 内容摘要：{content}")
-        context_block = "\n".join(lines) if lines else "（无）"
-        user_content = f"""你是新闻回答的事实核查员。你的唯一任务是检查回答是否捏造了新闻。
+    @staticmethod
+    def _normalize_reference_date(ref: str) -> Optional[str]:
+        """将 reference_date 规范为 YYYY-MM-DD；无效则返回 None。"""
+        if not ref or not isinstance(ref, str):
+            return None
+        ref = ref.strip()
+        if len(ref) == 10 and ref[4] == "-" and ref[7] == "-":
+            try:
+                datetime.strptime(ref, "%Y-%m-%d")
+                return ref
+            except ValueError:
+                pass
+        # 尝试 M月D日 + 默认年
+        m = re.match(r"(\d{1,2})月(\d{1,2})日", ref)
+        if m:
+            try:
+                y = datetime.now().year
+                dt = datetime(y, int(m.group(1)), int(m.group(2)))
+                return dt.strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        return None
 
-判断规则（非常宽松，倾向于通过）：
-- 通过：回答中的事实可以在检索到的新闻中找到依据（哪怕只是部分匹配或归纳）
-- 通过：回答播报了同领域的相关新闻内容
-- 通过：回答包含过渡语、总结性表述或对检索内容的合理概括
-- 不通过：回答**凭空编造**了检索结果中完全不存在的新闻事件、具体数据或来源名称
-
-注意：只要回答内容能在检索结果中找到出处，就应判「通过」。有疑问时，判「通过」。
-
-检索到的新闻：
-{context_block}
-
-用户问题：{query}
-回答内容：{answer}
-
-只输出「通过」或「不通过」。"""
+    @staticmethod
+    def _ts_to_date_str(ts: float, fallback: Optional[str] = None) -> Optional[str]:
+        """将 event_time_timestamp (float) 转为 YYYY-MM-DD"""
         try:
-            out = (self.chat([{"role": "user", "content": user_content}], temperature=0.1, max_tokens=50)) or ""
-            out = out.strip().replace(" ", "")
-            if "不通过" in out:
-                return False
+            dt = datetime.fromtimestamp(float(ts))
+            return dt.strftime("%Y-%m-%d")
+        except (ValueError, TypeError, OSError):
+            return fallback
+
+    @staticmethod
+    def _parse_rel_date_in_text(text: str, current_date: str) -> Optional[str]:
+        """从 rule_event_time 等文本解析「昨日」「昨天」等为 YYYY-MM-DD"""
+        if not text or not current_date:
+            return None
+        lower = text.strip().lower()
+        try:
+            base = datetime.strptime(current_date, "%Y-%m-%d")
+        except ValueError:
+            return None
+        from datetime import timedelta
+        if "今日" in lower or "今天" in lower:
+            return current_date
+        if "昨日" in lower or "昨天" in lower:
+            return (base - timedelta(days=1)).strftime("%Y-%m-%d")
+        if "前天" in lower or "前日" in lower:
+            return (base - timedelta(days=2)).strftime("%Y-%m-%d")
+        return None
+
+    @staticmethod
+    def has_evidence_for_date(
+        context: List[Dict],
+        reference_date: Optional[str],
+        current_date: Optional[str] = None,
+    ) -> bool:
+        """
+        校验 context 中是否含有该日期的证据。
+        优先用 rule_event_time、event_time_timestamp 标准化为 YYYY-MM-DD 比较；
+        赛况数据引擎 content 含该日也返回 True。避免仅扫正文文本。
+        """
+        if not reference_date or not context:
             return True
-        except Exception as e:
-            logger.warning(f"回答校验调用失败，视为通过: {e}")
+        canon = LLMService._normalize_reference_date(reference_date)
+        if not canon:
             return True
+        variants = []
+        try:
+            dt = datetime.strptime(canon, "%Y-%m-%d")
+            y, m, d = dt.year, dt.month, dt.day
+            variants = [canon, f"{y}年{m}月{d}日", f"{m}月{d}日", f"{m}-{d}", f"{m}/{d}"]
+        except ValueError:
+            variants = [canon]
+
+        for item in context:
+            src = (item.get("source") or "").strip()
+
+            # event_time_timestamp 标准化为 YYYY-MM-DD
+            ets = item.get("event_time_timestamp")
+            if ets is not None:
+                item_date = LLMService._ts_to_date_str(ets)
+                if item_date == canon:
+                    return True
+
+            # rule_event_time 标准化或解析
+            ret = item.get("rule_event_time")
+            if ret:
+                ret_str = (ret if isinstance(ret, str) else str(ret)).strip()
+                if ret_str.startswith(canon) or canon in ret_str:
+                    return True
+                for v in variants:
+                    if v in ret_str:
+                        return True
+                parsed = LLMService._parse_rel_date_in_text(ret_str, current_date or "")
+                if parsed == canon:
+                    return True
+
+            # 赛况数据引擎：content 中日期行
+            if src == "赛况数据引擎":
+                content = item.get("content") or ""
+                for line in content.split("\n"):
+                    for v in variants:
+                        if v in line:
+                            return True
+        return False
 
     def _format_to_markdown(self, answer: str) -> str:
         """
@@ -469,30 +569,39 @@ class LLMService:
             logger.warning(f"查询改写失败，使用原问题检索: {e}")
         return user_query
 
-    def expand_queries_for_search(self, user_query: str, num_variants: int = 3) -> List[str]:
+    def expand_queries_for_search(
+        self,
+        user_query: str,
+        num_variants: int = 3,
+        reference_date: Optional[str] = None,
+        current_date: Optional[str] = None,
+    ) -> List[str]:
         """
         生成多个检索查询变体，提升召回覆盖率。
-        
-        Args:
-            user_query: 用户原始问题
-            num_variants: 生成变体数量（默认3个）
-            
-        Returns:
-            检索查询变体列表
+
+        reference_date：检索变体可选锚点日期（来自 temporal_context.reference_date），
+        用于在变体中注入日期词以辅助召回；与「回答范围日期 answer_scope_date」无关。
         """
-        system_prompt = f"""你是一个检索查询扩展助手。任务：为用户问题生成 {num_variants} 个不同表述的检索关键词，用于向量检索。
+        base_prompt = f"""你是一个检索查询扩展助手。任务：为用户问题生成 {num_variants} 个不同表述的检索关键词，用于向量检索。
 
 要求：
 1. 每个变体使用不同的同义词或表述方式，覆盖更多可能的新闻标题/内容匹配
 2. 使用新闻报道中常见的词汇（资讯/新闻/报道/行情/走势/动向等）
 3. 避免抽象口语词（最新动态/相关情况/怎么样了）
-4. 每行输出一个变体，共 {num_variants} 行，不要编号，不要解释
+4. 每行输出一个变体，共 {num_variants} 行，不要编号，不要解释"""
+        if reference_date and current_date:
+            base_prompt += f"""
+
+今日日期：{current_date}
+用户询问的目标日期：{reference_date}（YYYY-MM-DD）。若查询涉及某日（如昨天/前天），检索变体中应包含该日期的明确表述，例如：{reference_date[:4]}年{reference_date[5:7]}月{reference_date[8:10]}日马刺比赛、{reference_date[5:7]}-{reference_date[8:10]}NBA赛果。"""
+        base_prompt += """
 
 示例输入：「体育最近怎么样」
 示例输出：
 体育赛事新闻
 体育资讯报道
 体育比赛动态"""
+        system_prompt = base_prompt
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_query},
@@ -517,6 +626,9 @@ class LLMService:
         coverage_note: str = "",
         original_query: Optional[str] = None,
         rewrite_reasoning: Optional[str] = None,
+        reference_date: Optional[str] = None,
+        current_date: Optional[str] = None,
+        detail_follow_up: bool = False,
     ) -> str:
         """
         基于上下文生成回答
@@ -528,12 +640,27 @@ class LLMService:
             coverage_note: 检索覆盖情况说明（多意图查询有缺失时由 pipeline 注入）
             original_query: 用户原始问题（用于 Grounding Prompt）
             rewrite_reasoning: 改写说明（若有）
+            reference_date: 回答范围日期（YYYY-MM-DD），由 pipeline 从 compute_answer_scope_date 传入；有则注入日期约束并做时间证据校验
+            current_date: 今日日期（YYYY-MM-DD）；用于 has_evidence / _verify_time_consistency 解析「昨日」等
+            detail_follow_up: 是否为细节追问；是则要求完整呈现比分/节次/球员，新闻稿可适度概括或原样
         Returns:
             AI回答
         """
         if system_prompt is None:
             system_prompt = self._build_news_system_prompt()
-        
+
+        if reference_date:
+            if not self.has_evidence_for_date(context, reference_date, current_date):
+                logger.info("时间证据校验: 检索结果中无目标日期证据，拒答。reference_date=%s", reference_date)
+                return "当前检索结果中未找到该日期的报道，无法据此作答。"
+
+        # 按报道时间从新到旧排序，保证正文序号与来源序号一致；无日期的排到末尾
+        context = sorted(
+            context,
+            key=lambda item: item.get("published_time") or "",
+            reverse=True,
+        )
+
         # 构建上下文文本（带序号，供来源引用）
         context_text = "\n\n".join(
             f"{i}. {self._format_news_item(item)}" for i, item in enumerate(context, 1)
@@ -542,6 +669,9 @@ class LLMService:
             context_text, query, coverage_note,
             original_query=original_query,
             rewrite_reasoning=rewrite_reasoning,
+            detail_follow_up=detail_follow_up,
+            reference_date=reference_date,
+            current_date=current_date,
         )
         
         messages = [
@@ -549,14 +679,6 @@ class LLMService:
             {"role": "user", "content": user_content}
         ]
         answer = self.chat(messages)
-        # 1. 捏造检测
-        if not self._verify_answer(query, answer, context):
-            logger.info("回答未通过事实核查，返回保守回复。被过滤的回答：{}", answer)
-            return "根据当前检索到的内容无法可靠回答该问题，请稍后重试或换个问法。"
-        # 2. 日期修正（仅在检测到模糊日期时调用）
-        answer = self._fix_date_formatting(answer, context)
-        # 3. Markdown 格式化（独立后处理）
-        answer = self._format_to_markdown(answer)
         return answer
 
     def generate_answer_stream(
@@ -568,15 +690,32 @@ class LLMService:
         coverage_note: str = "",
         original_query: Optional[str] = None,
         rewrite_reasoning: Optional[str] = None,
+        reference_date: Optional[str] = None,
+        current_date: Optional[str] = None,
+        detail_follow_up: bool = False,
     ) -> Iterator[Dict]:
         """
         基于上下文流式生成回答，yield 的每个事件为可 JSON 序列化的 dict：
         - 内容块: {"choices": [{"delta": {"content": "..."}}]}
-        - 校验失败替换: {"replace": "根据当前检索..."}
-        - 结束: {"sources": [...], "done": True}（由调用方注入 sources）
+        - 仅当「时间证据」缺失时 yield {"replace": "当前检索结果中未找到该日期的报道..."} 并 return
+        校验与替换由调用方（Pipeline）在收齐全文后执行。
+        reference_date 为回答范围日期（answer_scope_date），由 pipeline 传入。
         """
         if system_prompt is None:
             system_prompt = self._build_news_system_prompt()
+
+        if reference_date:
+            if not self.has_evidence_for_date(context, reference_date, current_date):
+                logger.info("时间证据校验: 检索结果中无目标日期证据，拒答。reference_date=%s", reference_date)
+                yield {"replace": "当前检索结果中未找到该日期的报道，无法据此作答。"}
+                return
+
+        # 按报道时间从新到旧排序，与 generate_answer 一致
+        context = sorted(
+            context,
+            key=lambda item: item.get("published_time") or "",
+            reverse=True,
+        )
 
         context_text = "\n\n".join(
             f"{i}. {self._format_news_item(item)}" for i, item in enumerate(context, 1)
@@ -585,6 +724,9 @@ class LLMService:
             context_text, query, coverage_note,
             original_query=original_query,
             rewrite_reasoning=rewrite_reasoning,
+            detail_follow_up=detail_follow_up,
+            reference_date=reference_date,
+            current_date=current_date,
         )
         #《Prompt Repetition Improves Non-Reasoning LLMs》 (arXiv:2512.14982)
         # 完整重复 prompt：让第二遍的 token 可以 attend 到第一遍的所有上下文
@@ -597,19 +739,58 @@ class LLMService:
         for chunk in self.chat_stream(messages, deep_think=deep_think):
             accumulated.append(chunk)
             yield {"choices": [{"delta": {"content": chunk}}]}
-        full_answer = "".join(accumulated)
-        # 1. 捏造检测
-        if not self._verify_answer(query, full_answer, context):
-            logger.info("流式回答未通过事实核查，返回保守回复。被过滤的回答：{}", full_answer)
-            yield {"replace": "根据当前检索到的内容无法可靠回答该问题，请稍后重试或换个问法。"}
-            return
-        # 2. 日期修正（仅在检测到模糊日期时调用）
-        answer = self._fix_date_formatting(full_answer, context)
-        # 3. Markdown 格式化（独立后处理）
-        answer = self._format_to_markdown(answer)
-        if answer != full_answer:
-            logger.info("流式回答已后处理（日期修正/Markdown格式化）")
-            yield {"replace": answer}
+        # 校验与后处理由 Pipeline 在收齐全文后执行
+
+    def generate_no_result_reply(
+        self,
+        query: str,
+        reference_date: Optional[str] = None,
+        current_date: Optional[str] = None,
+    ) -> str:
+        """
+        检索 0 条时由 agent 生成一句说明，不拼模板。
+        query 为改写后的独立查询，reference_date 为回答范围日期（若有）。
+        """
+        system = "你是菠萝快讯助手。当检索无结果时，用一两句话简要说明未检索到相关信息；若用户问的是某日某队/某主体，请明确写出日期与主体（如队名），避免让人误以为把「昨天」等时间词当关键词搜。"
+        date_info = ""
+        if reference_date:
+            try:
+                ref_dt = datetime.strptime(reference_date.strip()[:10], "%Y-%m-%d")
+                date_info = f"回答范围日期：{ref_dt.year}年{ref_dt.month}月{ref_dt.day}日。"
+            except ValueError:
+                date_info = f"回答范围日期：{reference_date}。"
+        else:
+            date_info = "未限定具体日期。"
+        user = f"检索结果为空。用户问题（独立查询）：{query}。{date_info}请用一两句话说明未检索到与该问题相关的信息。"
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        return self.chat(messages, temperature=0.3, max_tokens=150)
+
+    def generate_no_result_reply_stream(
+        self,
+        query: str,
+        reference_date: Optional[str] = None,
+        current_date: Optional[str] = None,
+    ) -> Iterator[Dict]:
+        """检索 0 条时由 agent 流式生成一句说明，yield 格式与 generate_answer_stream 一致。"""
+        system = "你是菠萝快讯助手。当检索无结果时，用一两句话简要说明未检索到相关信息；若用户问的是某日某队/某主体，请明确写出日期与主体（如队名），避免让人误以为把「昨天」等时间词当关键词搜。"
+        date_info = ""
+        if reference_date:
+            try:
+                ref_dt = datetime.strptime(reference_date.strip()[:10], "%Y-%m-%d")
+                date_info = f"回答范围日期：{ref_dt.year}年{ref_dt.month}月{ref_dt.day}日。"
+            except ValueError:
+                date_info = f"回答范围日期：{reference_date}。"
+        else:
+            date_info = "未限定具体日期。"
+        user = f"检索结果为空。用户问题（独立查询）：{query}。{date_info}请用一两句话说明未检索到与该问题相关的信息。"
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        for chunk in self.chat_stream(messages, temperature=0.3, max_tokens=150):
+            yield {"choices": [{"delta": {"content": chunk}}]}
+
+    def post_process_answer(self, answer: str, context: List[Dict]) -> str:
+        """对生成结果做日期规范修正与 Markdown 格式化（供 Pipeline 在通过校验后调用）。"""
+        answer = self._fix_date_formatting(answer, context)
+        return self._format_to_markdown(answer)
 
     def close(self):
         """关闭HTTP客户端"""

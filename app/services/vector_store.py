@@ -1,18 +1,20 @@
 # app/services/vector_store.py
 """
-向量数据库服务 - Qdrant集成
-按 Qdrant 官方最佳实践：单 collection + payload 索引（category keyword + published_timestamp float）
+向量数据库服务 - Qdrant 集成
+支持单向量（dense）与混合检索（dense + sparse，RRF 融合）。混合检索需 collection 含 sparse 向量且启用 RETRIEVAL_HYBRID_ENABLED。
 """
 import hashlib
 import re
 import time
 import uuid
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from datetime import datetime
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct, Filter, FieldCondition,
-    Range, MatchValue, MatchAny, PayloadSchemaType
+    Range, MatchValue, MatchAny, PayloadSchemaType,
+    SparseVector, SparseVectorParams, SparseVectorsConfig,
+    Prefetch, FusionQuery, Fusion,
 )
 from loguru import logger
 
@@ -51,6 +53,18 @@ def make_dedup_key(item: Dict) -> str:
     return title + parent
 
 
+def _get_hybrid_config() -> Dict[str, Any]:
+    try:
+        c = current_app.config
+        return {
+            "enabled": c.get("RETRIEVAL_HYBRID_ENABLED", False),
+            "dense_name": (c.get("RETRIEVAL_DENSE_VECTOR_NAME") or "").strip() or None,
+            "sparse_name": (c.get("RETRIEVAL_SPARSE_VECTOR_NAME") or "sparse").strip(),
+        }
+    except Exception:
+        return {"enabled": False, "dense_name": None, "sparse_name": "sparse"}
+
+
 class VectorStore:
     """向量数据库服务"""
     
@@ -84,6 +98,7 @@ class VectorStore:
             host=qdrant_host,
             port=qdrant_port
         )
+        self._last_retrieval_mode: Optional[str] = None
         self._ensure_collection()
     
     @property
@@ -91,23 +106,41 @@ class VectorStore:
         return self._client
     
     def _ensure_collection(self):
-        """确保集合存在，若不存在则创建并建 payload 索引"""
+        """确保集合存在；若不存在则创建。启用混合检索时新集合将包含 dense + sparse 向量配置。"""
         try:
             collections = self.client.get_collections().collections
             collection_names = [c.name for c in collections]
-            
+            hybrid = _get_hybrid_config()
+
             if self.collection_name not in collection_names:
                 logger.info(f"创建向量集合: {self.collection_name}")
-                self.client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config=VectorParams(
-                        size=self.embedding_service.get_embedding_dim(),
-                        distance=Distance.COSINE
+                dim = self.embedding_service.get_embedding_dim()
+                if hybrid["enabled"] and hybrid["dense_name"]:
+                    vectors_config = {
+                        hybrid["dense_name"]: VectorParams(
+                            size=dim,
+                            distance=Distance.COSINE,
+                        )
+                    }
+                    sparse_config = {
+                        hybrid["sparse_name"]: SparseVectorParams(),
+                    }
+                    self.client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config=vectors_config,
+                        sparse_vectors_config=sparse_config,
                     )
-                )
-                # 创建 payload 索引
+                    logger.info("向量集合创建成功（含 sparse，支持混合检索）")
+                else:
+                    self.client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config=VectorParams(
+                            size=dim,
+                            distance=Distance.COSINE,
+                        )
+                    )
+                    logger.info("向量集合创建成功")
                 self._create_payload_indexes()
-                logger.info("向量集合创建成功，payload 索引已建立")
             else:
                 logger.info(f"向量集合已存在: {self.collection_name}")
         except Exception as e:
@@ -154,7 +187,9 @@ class VectorStore:
         filter_category: Optional[str] = None,
         filter_categories: Optional[List[str]] = None,
         filter_date_from: Optional[str] = None,
-        filter_date_to: Optional[str] = None
+        filter_date_to: Optional[str] = None,
+        filter_event_time_from: Optional[str] = None,
+        filter_event_time_to: Optional[str] = None,
     ) -> List[Dict]:
         """
         向量搜索，支持 source、category、日期 range 过滤。
@@ -214,7 +249,7 @@ class VectorStore:
                 )
             except Exception as e:
                 logger.warning(f"解析 filter_date_from 失败: {filter_date_from}, {e}")
-        
+
         if filter_date_to:
             try:
                 if "T" in filter_date_to:
@@ -228,25 +263,103 @@ class VectorStore:
                 )
             except Exception as e:
                 logger.warning(f"解析 filter_date_to 失败: {filter_date_to}, {e}")
+
+        # event_time 范围过滤（用 event_time_timestamp float，有则过滤）
+        if filter_event_time_from:
+            try:
+                if "T" in filter_event_time_from:
+                    dt = datetime.fromisoformat(filter_event_time_from)
+                else:
+                    dt = datetime.strptime(filter_event_time_from, "%Y-%m-%d")
+                gte = dt.timestamp()
+                filter_conditions.append(
+                    FieldCondition(key="event_time_timestamp", range=Range(gte=gte))
+                )
+            except Exception as e:
+                logger.warning(f"解析 filter_event_time_from 失败: {filter_event_time_from}, {e}")
+        if filter_event_time_to:
+            try:
+                if "T" in filter_event_time_to:
+                    dt = datetime.fromisoformat(filter_event_time_to)
+                else:
+                    dt = datetime.strptime(filter_event_time_to, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+                lte = dt.timestamp()
+                filter_conditions.append(
+                    FieldCondition(key="event_time_timestamp", range=Range(lte=lte))
+                )
+            except Exception as e:
+                logger.warning(f"解析 filter_event_time_to 失败: {filter_event_time_to}, {e}")
         
         query_filter = Filter(must=filter_conditions) if filter_conditions else None
         
-        # 过采：Qdrant 多拉候选，在内存中做两级去重后返回 top_k
-        # 1) news_id 去重（同一文章的不同 chunk 只取最相关的）
-        # 2) title + parent_source 去重（同大源不同细分的同一篇稿件只保留一条）
+        # 过采：多拉候选，内存中两级去重后返回 top_k
         fetch_limit = top_k * 5
 
-        # 执行搜索
+        # 混合检索：若启用且 collection 含 sparse 且能拿到 query sparse，则用 Prefetch + RRF
+        hybrid_cfg = _get_hybrid_config()
+        use_hybrid = False
+        hybrid_reason = ""
+        if hybrid_cfg["enabled"] and hybrid_cfg["dense_name"]:
+            try:
+                coll = self.client.get_collection(self.collection_name)
+                sparse_params = getattr(getattr(coll, "config", None), "params", None)
+                has_sparse = sparse_params and getattr(sparse_params, "sparse_vectors", None)
+                query_sparse = self.embedding_service.encode_query_sparse(query_text)
+                if has_sparse and query_sparse:
+                    use_hybrid = True
+                elif not has_sparse:
+                    hybrid_reason = "collection无sparse向量"
+                else:
+                    hybrid_reason = "embed_sparse不可用或返回空"
+            except Exception as e:
+                logger.debug(f"[VectorStore.search] 混合检索检查失败，回退纯 dense: {e}")
+                hybrid_reason = str(e)
+        else:
+            if not hybrid_cfg["enabled"]:
+                hybrid_reason = "hybrid未启用"
+            else:
+                hybrid_reason = "未配置dense向量名"
+        if use_hybrid:
+            logger.info("[VectorStore.search] 检索模式: dense+sparse (RRF 融合)")
+            self._last_retrieval_mode = "dense+sparse"
+        else:
+            logger.info("[VectorStore.search] 检索模式: dense-only" + (f"，原因: {hybrid_reason}" if hybrid_reason else ""))
+            self._last_retrieval_mode = "dense-only"
+
         try:
-            response = self.client.query_points(
-                collection_name=self.collection_name,
-                query=query_vector,
-                limit=fetch_limit,
-                query_filter=query_filter
-            )
-            results = response.points or []
+            if use_hybrid:
+                indices, values = query_sparse
+                sparse_vec = SparseVector(indices=indices, values=values)
+                response = self.client.query_points(
+                    collection_name=self.collection_name,
+                    prefetch=[
+                        Prefetch(
+                            query=query_vector,
+                            using=hybrid_cfg["dense_name"],
+                            limit=fetch_limit,
+                        ),
+                        Prefetch(
+                            query=sparse_vec,
+                            using=hybrid_cfg["sparse_name"],
+                            limit=fetch_limit,
+                        ),
+                    ],
+                    query=FusionQuery(fusion=Fusion.RRF),
+                    limit=fetch_limit,
+                    query_filter=query_filter,
+                )
+                results = response.points or []
+                logger.info("[VectorStore.search] dense+sparse RRF 返回 %d 条候选", len(results))
+            else:
+                response = self.client.query_points(
+                    collection_name=self.collection_name,
+                    query=query_vector,
+                    limit=fetch_limit,
+                    query_filter=query_filter
+                )
+                results = response.points or []
             
-            # 两级去重（Qdrant 返回结果已按 score 降序，直接遍历取 top_k 即可）
+            # 两级去重（同 news_id 只保留最相关 chunk；同大源+同标题只保留一条）
             search_results = []
             seen_news_ids = set()
             seen_dedup_keys = set()
@@ -271,6 +384,14 @@ class VectorStore:
                     "published_time": raw("published_time"),
                     "chunk_index": payload.get("chunk_index", 0),
                 }
+                if payload.get("rule_event_time") is not None:
+                    item["rule_event_time"] = raw("rule_event_time")
+                if payload.get("event_time_timestamp") is not None:
+                    item["event_time_timestamp"] = payload.get("event_time_timestamp")
+                if payload.get("event_time_confidence") is not None:
+                    item["event_time_confidence"] = payload.get("event_time_confidence")
+                if payload.get("event_time_source") is not None:
+                    item["event_time_source"] = raw("event_time_source")
 
                 # 第二级：稿件去重（同大源 + 同标题 → 同一篇稿件）
                 dedup_key = make_dedup_key(item)
@@ -284,8 +405,9 @@ class VectorStore:
 
             elapsed_ms = (time.perf_counter() - t0) * 1000
             results_preview = query_text[:40] + "..." if len(query_text) > 40 else query_text
+            mode = "dense+sparse" if use_hybrid else "dense-only"
             logger.info(
-                f"[VectorStore.search] 完成: query_preview={repr(results_preview)}, "
+                f"[VectorStore.search] 完成: mode={mode}, query_preview={repr(results_preview)}, "
                 f"results={len(search_results)}, elapsed_ms={elapsed_ms:.2f}"
             )
             return search_results
@@ -303,6 +425,8 @@ class VectorStore:
         filter_categories: Optional[List[str]] = None,
         filter_date_from: Optional[str] = None,
         filter_date_to: Optional[str] = None,
+        filter_event_time_from: Optional[str] = None,
+        filter_event_time_to: Optional[str] = None,
         fallback_query: Optional[str] = None,
         score_threshold: float = 0.3
     ) -> List[Dict]:
@@ -327,7 +451,9 @@ class VectorStore:
                     filter_category=filter_category,
                     filter_categories=filter_categories,
                     filter_date_from=filter_date_from,
-                    filter_date_to=filter_date_to
+                    filter_date_to=filter_date_to,
+                    filter_event_time_from=filter_event_time_from,
+                    filter_event_time_to=filter_event_time_to,
                 )
                 for item in results:
                     key = make_dedup_key(item)
@@ -351,7 +477,9 @@ class VectorStore:
                     filter_category=filter_category,
                     filter_categories=filter_categories,
                     filter_date_from=filter_date_from,
-                    filter_date_to=filter_date_to
+                    filter_date_to=filter_date_to,
+                    filter_event_time_from=filter_event_time_from,
+                    filter_event_time_to=filter_event_time_to,
                 )
                 # 合并 fallback 结果
                 for item in fallback_results:
