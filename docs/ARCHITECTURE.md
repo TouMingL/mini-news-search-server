@@ -30,10 +30,12 @@
 │  Pipeline.run_stream(PipelineInput)                                              │
 │       │                                                                          │
 │       ├── 1. 加载对话历史（DB）                                                   │
-│       ├── 2. 查询改写（LocalLLM）                                                 │
-│       ├── 3. 意图分类（LocalLLM）                                                 │
-│       ├── 4. 路由决策（Router）                                                   │
-│       └── 5. 执行层                                                              │
+│       ├── 2. 时间解析（TemporalResolver + TimeIntentClassifier）                  │
+│       ├── 3. 路由分类（RouteLLM）                                                 │
+│       ├── 4. 追问类型/时间继承                                                    │
+│       ├── 5. 查询改写（QueryRewriter）                                            │
+│       ├── 6. 路由决策（Router.decide）                                            │
+│       └── 7. 执行层                                                              │
 │              ├── search_then_generate → 检索 + LLM 生成                           │
 │              └── generate_direct     → LLM 直接生成（带历史）                      │
 │       │                                                                          │
@@ -131,29 +133,47 @@ UserInput
 └───────────────┬───────────────────┘
                 ▼
 ┌───────────────────────────────────┐
-│ 2. 预处理层：QueryRewriter         │
-│    rewrite(current_input, history)│
+│ 2. 时间解析                        │
+│    TemporalResolver.resolve()     │
+│    TimeIntentClassifier.classify()│
+│    输出：temporal_context, time_intent │
+└───────────────┬───────────────────┘
+                ▼
+┌───────────────────────────────────┐
+│ 3. 分类层：RouteLLM                │
+│    invoke(query, last_turn_category)│
+│    本地小 LLM 做实体提取+意图识别  │
+│    规则层 derive_route_output 推导 │
+│    输出：RouteLLMOutput            │
+│    (need_retrieval, need_scores,  │
+│     filter_category, time_sensitivity, follow_up_time_type) │
+└───────────────┬───────────────────┘
+                ▼
+┌───────────────────────────────────┐
+│ 4. 追问类型/时间继承               │
+│    追问时继承 history 推断的时间   │
+│    输出：follow_up_type, answer_scope_date │
+└───────────────┬───────────────────┘
+                ▼
+┌───────────────────────────────────┐
+│ 5. 预处理层：QueryRewriter         │
+│    rewrite(current_input, history,│
+│     category_hint, follow_up_type)│
 │    本地小 LLM 消解指代、补全省略   │
 │    输出：standalone_query         │
 └───────────────┬───────────────────┘
                 ▼
 ┌───────────────────────────────────┐
-│ 3. 分类层：IntentClassifier        │
-│    classify(standalone_query)     │
-│    本地小 LLM 输出：               │
-│    needs_search, intent_type,     │
-│    category, time_sensitivity...  │
-└───────────────┬───────────────────┘
-                ▼
-┌───────────────────────────────────┐
-│ 4. 决策层：Router                  │
-│    decide(classification, state,  │
-│           standalone_query)       │
+│ 6. 决策层：Router.decide           │
+│    decide(route_llm_output, state,│
+│     standalone_query, temporal_   │
+│     context, time_intent,         │
+│     effective_last_category)      │
 │    输出：RouteDecision.action     │
 └───────────────┬───────────────────┘
                 ▼
 ┌───────────────────────────────────┐
-│ 5. 执行层：_execute_stream()       │
+│ 7. 执行层：_execute_stream()       │
 │    根据 action 分支执行            │
 └───────────────────────────────────┘
                 │
@@ -175,13 +195,13 @@ LLM.generate_answer_stream()
     │
     ▼
 ┌───────────────────────────────────┐
-│ 6. 更新会话状态                    │
+│ 8. 更新会话状态                    │
 │    SessionStateManager.update_state│
 │    last_category, search_count... │
 └───────────────┬───────────────────┘
                 ▼
 ┌───────────────────────────────────┐
-│ 7. 记录日志                        │
+│ 9. 记录日志                        │
 │    PipelineLogger.log()           │
 └───────────────────────────────────┘
 ```
@@ -190,18 +210,31 @@ LLM.generate_answer_stream()
 
 **文件**: `miniprogram-server/app/services/router.py`
 
+**签名**:
+```python
+decide(
+    route_llm_output: RouteLLMOutput,
+    state: SessionState,
+    standalone_query: str,
+    temporal_context: Optional[TemporalContext] = None,
+    time_intent: Optional[TimeIntent] = None,
+    effective_last_category: Optional[str] = None,
+) -> RouteDecision
+```
+
+**决策逻辑**（按优先级）:
+
 | 条件 | action | 说明 |
 |------|--------|------|
+| 无意义查询保护 (need_retrieval 且查询无效) | generate_direct | 无法执行检索 |
 | 搜索循环保护 (search_count >= 5) | generate_direct | 强制直接生成 |
-| intent_type == chitchat | generate_direct | 闲聊 |
-| intent_type == knowledge 且 !needs_search | generate_direct | 常识问答 |
-| needs_search == true | search_then_generate | 新闻/行情等 |
-| 实时行情 + filter_category == economy | search_then_generate | 降级为检索 |
-| intent_type == tool | generate_direct | 工具未实现，降级 |
-| Fallback 有时效性 | search_then_generate | 检索 |
-| 其他 | generate_direct | 默认直接生成 |
+| need_scores 且 category=sports | tool_scores | 赛况引擎 |
+| need_retrieval == true | search_then_generate | 检索+生成 |
+| 其他 | generate_direct | 直接生成 |
 
-**filter_category**：由 IntentClassifier 直接输出，与向量库 category 一致（academic/world/tech/economy/sports/general/health），无二次映射。LLM 根据查询内容（如「羽毛球」-> sports）直接判断，避免语义 category 映射到 filter_category 时的信息损失。
+**上下文漂移**：当 `effective_last_category` 与 `route_llm_output.filter_category` 不同且非 general 时，重置 `state.search_count`，与删上数轮 Q&A 兼容。
+
+**filter_category**：由 RouteLLM 输出（RouteLLMOutput.filter_category），与向量库 category 一致（academic/world/tech/economy/sports/general/health），无二次映射。Parser LLM 根据查询内容（如「羽毛球」-> sports）直接判断，避免语义 category 映射到 filter_category 时的信息损失。
 
 ### 3.4 执行层分支
 

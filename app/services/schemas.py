@@ -79,6 +79,12 @@ TimeFilterStrategy = Literal["publish_time_only", "event_time_with_fallback"]
 # AnswerScopeDate: 本问是否限定「只答某一天」；有值则注入日期约束并做时间对齐，None 则不限定。
 # 类型约定为 Optional[str]（YYYY-MM-DD），由 compute_answer_scope_date() 产出。
 AnswerScopeDate = Optional[str]
+
+# AnswerScopeMode: 目标日约束的宽严策略，由 compute_answer_scope_mode() 在检索完成后根据 context 产出。
+# strict_date  — 仅可播报事件发生日期等于 answer_scope_date 的新闻。
+# report_day_ok — 无目标日事件但有目标日报道时，允许「未找到目标日当天…；根据目标日报道前几日有…」。
+AnswerScopeMode = Literal["strict_date", "report_day_ok"]
+
 # 检索时间范围与 search_params 时间部分一致，由 compute_retrieval_scope() 产出并合并进 search_params。
 
 
@@ -99,6 +105,47 @@ FILTER_CATEGORY = Literal[
 # 路由小 LLM 输出（仅用户句 + 上轮类别输入，用于 Router 决策）
 # action 由 Router 根据 need_retrieval + need_scores 推导，不在此处枚举
 TimeSensitivity = Literal["realtime", "recent", "historical", "none"]
+
+
+# ============ Query Parser LLM 输出（结构化理解） ============
+
+QueryEntityType = Literal[
+    "team", "player", "league", "sport_type",
+    "financial", "person", "org", "time", "location", "other",
+]
+
+QueryIntentType = Literal[
+    "scores",         # 比分/赛果/几比几
+    "player_stats",   # 球员数据/详细统计
+    "game_detail",    # 比赛细节/打得怎么样
+    "news",           # 新闻/报道/动态
+    "realtime_quote", # 实时行情/价格
+    "general_query",  # 一般信息查询
+    "chitchat",       # 闲聊/问候
+]
+
+
+class QueryEntity(BaseModel):
+    """用户查询中提取的实体。"""
+    type: QueryEntityType = Field(description="实体类型")
+    value: str = Field(description="实体原文")
+
+
+class QueryParseResult(BaseModel):
+    """Parser LLM 输出：对用户查询的结构化理解，用于下游规则推导路由决策。"""
+    entities: List[QueryEntity] = Field(default_factory=list, description="提取的实体列表")
+    intent: QueryIntentType = Field(default="general_query", description="用户意图类型")
+    category: FILTER_CATEGORY = Field(default="general", description="查询主类别")
+    time_sensitivity: TimeSensitivity = Field(default="none", description="时效性")
+    follow_up_type: Optional[FollowUpType] = Field(default=None, description="追问类型；非追问时为 None")
+
+    @field_validator("follow_up_type", mode="before")
+    @classmethod
+    def _null_string_to_none(cls, v: Any) -> Any:
+        """小模型常输出字符串 "null" 而非 JSON null。"""
+        if v == "null" or v == "None":
+            return None
+        return v
 
 
 def _action_from_intent(need_retrieval: bool, need_scores: bool) -> str:
@@ -271,10 +318,10 @@ class RouteDecision(BaseModel):
 
 class LatencyMetrics(BaseModel):
     """各阶段耗时指标"""
-    total_ms: float = Field(default=0.0)
-    rewrite_ms: float = Field(default=0.0)
+    total_ms:    float = Field(default=0.0)
+    rewrite_ms:  float = Field(default=0.0)
     classify_ms: float = Field(default=0.0)
-    route_ms: float = Field(default=0.0)
+    route_ms:    float = Field(default=0.0)
     retrieve_ms: float = Field(default=0.0)
     generate_ms: float = Field(default=0.0)
 
@@ -351,10 +398,10 @@ class PipelineInput(BaseModel):
     )
     # 检索参数透传
     top_k: int = Field(default=5, ge=1, le=20)
-    filter_source: Optional[str] = Field(default=None)
-    filter_category: Optional[str] = Field(default=None)
+    filter_source:    Optional[str] = Field(default=None)
+    filter_category:  Optional[str] = Field(default=None)
     filter_date_from: Optional[str] = Field(default=None)
-    filter_date_to: Optional[str] = Field(default=None)
+    filter_date_to:   Optional[str] = Field(default=None)
 
 
 class PipelineOutput(BaseModel):

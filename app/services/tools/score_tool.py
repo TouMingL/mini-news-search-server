@@ -335,6 +335,10 @@ def _read_boxscore_date(
                     "投篮": p.get("投篮", ""),
                     "3分": p.get("3分", ""),
                     "罚球": p.get("罚球", ""),
+                    "抢断": p.get("抢断", ""),
+                    "封盖": p.get("封盖", ""),
+                    "失误": p.get("失误", ""),
+                    "+/-": p.get("+/-", ""),
                 })
             return out[:max_show]
 

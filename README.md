@@ -1,6 +1,6 @@
 # Flask后端服务器
 
-微信小程序后端API服务器，提供用户登录和用户信息管理功能。
+微信小程序后端API服务器。提供：用户登录与会话管理、统一对话入口（RAG + 直接生成）、时间解析与追问继承、赛况引擎等。
 
 ## 环境要求
 
@@ -11,18 +11,33 @@
 
 ```
 miniprogram-server/
-├── app/                    # 主应用包
+├── app/
 │   ├── __init__.py        # 应用工厂
 │   ├── config.py          # 配置（多环境支持）
 │   ├── extensions.py      # 扩展管理
 │   ├── models/            # 数据模型
 │   ├── api/               # API蓝图
-│   ├── utils/             # 工具函数
-│   └── middlewares/       # 中间件
-├── migrations/            # 数据库迁移
-├── tests/                 # 单元测试
-├── run.py                 # 启动入口
-└── .env                   # 环境变量
+│   │   ├── auth.py        # 微信登录
+│   │   ├── user.py        # 用户信息
+│   │   ├── chat.py        # 统一对话入口 POST /api/chat (SSE)
+│   │   ├── conversations.py # 会话与消息同步
+│   │   ├── rag.py         # RAG 相关
+│   │   ├── sync.py        # 同步接口
+│   │   └── notify.py      # 通知
+│   ├── services/          # 核心业务服务
+│   │   ├── pipeline.py    # 对话编排 Pipeline
+│   │   ├── route_llm.py   # 路由分类 RouteLLM
+│   │   ├── router.py      # 路由决策 Router
+│   │   ├── query_rewriter.py # 查询改写
+│   │   └── pipeline_modules/ # Pipeline 子模块
+│   ├── utils/
+│   └── middlewares/
+├── docs/                  # 架构与设计文档
+│   └── ARCHITECTURE.md    # 前后端对话流程
+├── migrations/
+├── tests/
+├── run.py
+└── .env
 ```
 
 ## 安装依赖
@@ -68,6 +83,31 @@ flask run
 服务器将在 `http://0.0.0.0:8081` 启动。
 
 ## API接口
+
+### 0. 统一对话入口（主流程）
+
+**POST** `/api/chat`
+
+请求头:
+```
+Authorization: Bearer {token}  # 可选
+```
+
+请求体:
+```json
+{
+  "query": "用户输入内容",
+  "conversation_id": "会话ID",
+  "history_turns": 5
+}
+```
+
+响应: SSE 流 (`text/event-stream`)
+- `choices[0].delta.content`: 增量文本
+- `replace`: 校验失败时整段替换
+- `sources`, `done`: 流结束
+
+流程详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ### 1. 微信登录
 
@@ -158,10 +198,13 @@ curl -X GET http://localhost:8081/api/user/info \
 
 ## 架构说明
 
-项目采用Flask Application Factory模式，支持多环境配置：
-- **开发环境** (development): 默认环境，启用DEBUG
-- **生产环境** (production): 通过 `FLASK_ENV=production` 设置
-- **测试环境** (testing): 用于单元测试
+- **对话 Pipeline**：`Pipeline.run_stream()` 串联「加载历史 → 时间解析 → RouteLLM 分类 → 追问/时间继承 → QueryRewriter 改写 → Router.decide → 执行层」。执行分支：`search_then_generate`（检索+生成）、`generate_direct`（直接生成）、`tool_scores`（赛况引擎）。
+- **Flask 模式**：Application Factory，支持多环境配置：
+  - **开发环境** (development): 默认环境，启用DEBUG
+  - **生产环境** (production): 通过 `FLASK_ENV=production` 设置
+  - **测试环境** (testing): 用于单元测试
+
+详细数据流与 decide 签名见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 注意事项
 

@@ -225,9 +225,11 @@ class LLMService:
 （错误：日期模糊化，且合并了多条新闻的日期）
 </BAD>"""
 
+    _MIXED_DATE_RE = re.compile(r'(\d{1,2})月(\d{1,2})日')
+
     @staticmethod
-    def _format_news_item(item: dict) -> str:
-        """格式化单条新闻用于 prompt 上下文"""
+    def _format_news_item(item: dict, answer_scope_mode: str = "strict_date") -> str:
+        """格式化单条新闻用于 prompt 上下文，strict_date 模式下标注混合日期素材"""
         parts = [f"【来源：{item.get('source', '')}】"]
         if item.get("published_time"):
             parts.append(f"报道发布时间（非事件发生时间）：{item['published_time']}")
@@ -235,7 +237,11 @@ class LLMService:
         if item.get("link"):
             parts.append(f"链接：{item['link']}")
         content = item.get('content', '')
-        # 尽量保留完整正文，避免因截断导致模型用通用知识脑补
+        if answer_scope_mode == "strict_date" and content:
+            day_set = {(m.group(1), m.group(2)) for m in LLMService._MIXED_DATE_RE.finditer(content)}
+            if len(day_set) >= 2:
+                day_labels = "、".join(f"{mo}月{d}日" for mo, d in sorted(day_set))
+                parts.append(f"【注意：本文涉及多个事件日期（{day_labels}），请逐段判断事件日期】")
         if len(content) > 1500:
             parts.append(f"内容：{content[:1500]}...（已截断）")
         else:
@@ -252,8 +258,9 @@ class LLMService:
         detail_follow_up: bool = False,
         reference_date: Optional[str] = None,
         current_date: Optional[str] = None,
+        answer_scope_mode: str = "strict_date",
     ) -> str:
-        """构建新闻回答的 user prompt（含回答要求 + 检索覆盖情况 + 检索内容 + 用户问题）。reference_date 为回答范围日期（answer_scope_date），有值时才注入「目标日期」约束。"""
+        """构建新闻回答的 user prompt（含回答要求 + 检索覆盖情况 + 检索内容 + 用户问题）。reference_date 为回答范围日期（answer_scope_date），有值时才注入「目标日期」约束。answer_scope_mode 决定约束宽严。"""
         instruction = LLMService._build_news_answer_instruction()
         coverage_block = f"\n{coverage_note}\n" if coverage_note else ""
         grounding_block = ""
@@ -274,13 +281,27 @@ class LLMService:
             try:
                 ref_dt = datetime.strptime(reference_date.strip()[:10], "%Y-%m-%d")
                 ref_ymd = f"{ref_dt.year}年{ref_dt.month}月{ref_dt.day}日"
-                date_constraint = (
-                    "## 日期约束（最高优先级）\n"
-                    f"本问题询问的是「刚结束/今天」等时间范围，目标日期为 **{ref_ymd}**。\n"
-                    "- 你**仅可播报事件发生日期等于该日的新闻**。正文中的「报道发布时间」不是事件发生日期；事件发生日期以正文内「X月X日讯」「X月X日」等为准。\n"
-                    "- 播报时**必须在回答中明确写出事件日期**（如「YYYY年M月D日」）；若目标日即为今日，可写「今天」且仅当该事件确为今日发生时。\n"
-                    "- **禁止**用「刚刚」「刚结束」等模糊词指代非当日的旧闻；若检索结果中无该日期的比赛/事件，应明确说明「该日暂无」或「目前没有该日已结束的场次」等。\n"
-                )
+                if answer_scope_mode == "report_day_ok":
+                    date_constraint = (
+                        "## 日期约束（最高优先级）\n"
+                        f"本问题询问的目标日期为 **{ref_ymd}**。\n"
+                        f"- 检索结果中**没有**事件发生日期等于 {ref_ymd} 的新闻，但有该日发布的、描述前几日事件的报道。\n"
+                        f"- 你**必须**先明确说明「未检索到 {ref_ymd} 当天的比赛/赛事」。\n"
+                        f"- 然后用「根据 {ref_ymd} 的报道，前几日的比赛消息有：」引出，并逐条播报。\n"
+                        f"- 播报时**必须使用正文中的真实事件日期**（如 X月X日），严禁将事件日改写为 {ref_ymd}。\n"
+                        "- 每条仍须标注【媒体名】出处。\n"
+                    )
+                else:
+                    date_constraint = (
+                        "## 日期约束（最高优先级）\n"
+                        f"本问题询问的目标日期为 **{ref_ymd}**。\n"
+                        f"- **优先播报**事件发生日期等于 {ref_ymd} 的新闻。事件发生日期以正文内「X月X日」等为准，不是报道发布时间。\n"
+                        f"- **混合日期素材**：同一篇新闻可能包含多天事件（如「27日八强出炉…28日1/4决赛…」），你必须逐段判断事件日期，严禁将其他日期的事件归入 {ref_ymd} 播报。\n"
+                        f"- 若素材中有发布于 {ref_ymd} 但描述前几日事件的报道，在播报完 {ref_ymd} 当天事件后，可用「此外，根据 {ref_ymd} 的报道，X月X日...」格式补充，需标注真实事件日期。\n"
+                        f"- 若检索结果中完全无 {ref_ymd} 的事件，但有该日发布的报道，则用「未检索到 {ref_ymd} 当天的比赛/赛事，但根据 {ref_ymd} 的报道，前几日...」引出。\n"
+                        f"- **日期呈现**：单一日期在开头统一说明即可，不必逐条重复；涉及多天则按日期分组呈现。用户可能使用「上周二」「昨天」等相对日期提问，你**必须在回答开头将其转为显式日期**，格式为「上周六（{ref_dt.month}月{ref_dt.day}日）」或直接使用「{ref_ymd}」，严禁回答中只出现相对日期而无对应的显式日期。\n"
+                        f"- **禁止**用「刚刚」「刚结束」等模糊词指代非当日的旧闻。\n"
+                    )
                 if "进行中" in context_text:
                     date_constraint += "- 若检索内容中某场比赛标注为「进行中」，则回答中对该场**仅可写当前比分与领先方**，**不得**使用「获胜」「击败」「取胜」「险胜」等表示已结束的措辞。\n"
                 date_constraint += "\n"
@@ -629,6 +650,7 @@ class LLMService:
         reference_date: Optional[str] = None,
         current_date: Optional[str] = None,
         detail_follow_up: bool = False,
+        answer_scope_mode: str = "strict_date",
     ) -> str:
         """
         基于上下文生成回答
@@ -643,13 +665,14 @@ class LLMService:
             reference_date: 回答范围日期（YYYY-MM-DD），由 pipeline 从 compute_answer_scope_date 传入；有则注入日期约束并做时间证据校验
             current_date: 今日日期（YYYY-MM-DD）；用于 has_evidence / _verify_time_consistency 解析「昨日」等
             detail_follow_up: 是否为细节追问；是则要求完整呈现比分/节次/球员，新闻稿可适度概括或原样
+            answer_scope_mode: 目标日约束的宽严策略（strict_date / report_day_ok）
         Returns:
             AI回答
         """
         if system_prompt is None:
             system_prompt = self._build_news_system_prompt()
 
-        if reference_date:
+        if reference_date and answer_scope_mode != "report_day_ok":
             if not self.has_evidence_for_date(context, reference_date, current_date):
                 logger.info("时间证据校验: 检索结果中无目标日期证据，拒答。reference_date=%s", reference_date)
                 return "当前检索结果中未找到该日期的报道，无法据此作答。"
@@ -663,7 +686,7 @@ class LLMService:
 
         # 构建上下文文本（带序号，供来源引用）
         context_text = "\n\n".join(
-            f"{i}. {self._format_news_item(item)}" for i, item in enumerate(context, 1)
+            f"{i}. {self._format_news_item(item, answer_scope_mode=answer_scope_mode)}" for i, item in enumerate(context, 1)
         )
         user_content = self._build_news_user_prompt(
             context_text, query, coverage_note,
@@ -672,6 +695,7 @@ class LLMService:
             detail_follow_up=detail_follow_up,
             reference_date=reference_date,
             current_date=current_date,
+            answer_scope_mode=answer_scope_mode,
         )
         
         messages = [
@@ -693,6 +717,7 @@ class LLMService:
         reference_date: Optional[str] = None,
         current_date: Optional[str] = None,
         detail_follow_up: bool = False,
+        answer_scope_mode: str = "strict_date",
     ) -> Iterator[Dict]:
         """
         基于上下文流式生成回答，yield 的每个事件为可 JSON 序列化的 dict：
@@ -700,11 +725,12 @@ class LLMService:
         - 仅当「时间证据」缺失时 yield {"replace": "当前检索结果中未找到该日期的报道..."} 并 return
         校验与替换由调用方（Pipeline）在收齐全文后执行。
         reference_date 为回答范围日期（answer_scope_date），由 pipeline 传入。
+        answer_scope_mode 决定目标日约束宽严（strict_date / report_day_ok）。
         """
         if system_prompt is None:
             system_prompt = self._build_news_system_prompt()
 
-        if reference_date:
+        if reference_date and answer_scope_mode != "report_day_ok":
             if not self.has_evidence_for_date(context, reference_date, current_date):
                 logger.info("时间证据校验: 检索结果中无目标日期证据，拒答。reference_date=%s", reference_date)
                 yield {"replace": "当前检索结果中未找到该日期的报道，无法据此作答。"}
@@ -718,7 +744,7 @@ class LLMService:
         )
 
         context_text = "\n\n".join(
-            f"{i}. {self._format_news_item(item)}" for i, item in enumerate(context, 1)
+            f"{i}. {self._format_news_item(item, answer_scope_mode=answer_scope_mode)}" for i, item in enumerate(context, 1)
         )
         original_user_text = self._build_news_user_prompt(
             context_text, query, coverage_note,
@@ -727,6 +753,7 @@ class LLMService:
             detail_follow_up=detail_follow_up,
             reference_date=reference_date,
             current_date=current_date,
+            answer_scope_mode=answer_scope_mode,
         )
         #《Prompt Repetition Improves Non-Reasoning LLMs》 (arXiv:2512.14982)
         # 完整重复 prompt：让第二遍的 token 可以 attend 到第一遍的所有上下文

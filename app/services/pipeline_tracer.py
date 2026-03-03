@@ -174,13 +174,26 @@ class PipelineTracer:
         last_filter_category: Optional[str],
         result_dict: Dict[str, Any],
         elapsed_ms: float,
+        parse_result_dict: Optional[Dict[str, Any]] = None,
     ):
-        """[STEP 1] 路由小 LLM (Qwen)：仅输入用户句 + 上轮类别，输出 action/filter_category 等"""
+        """[STEP 1] 路由小 LLM (Qwen)：Parser LLM 输出结构化理解 + 规则推导结果"""
         self._w(f"[STEP 1] 路由小 LLM (Qwen) | 耗时 {elapsed_ms:.1f}ms")
         self._w(self._SUB)
         self._w(f"用户句: {user_utterance}")
         self._w(f"上轮类别: {last_filter_category or '无'}")
-        self._w("<<< RouteLLM Output <<<")
+        if parse_result_dict:
+            self._w("<<< QueryParser Output <<<")
+            entities = parse_result_dict.get("entities", [])
+            if entities:
+                for e in entities:
+                    self._w(f"  entity: [{e.get('type', '?')}] {e.get('value', '?')}")
+            else:
+                self._w("  (无实体)")
+            self._w(f"  intent: {parse_result_dict.get('intent', '?')}")
+            self._w(f"  category: {parse_result_dict.get('category', '?')}")
+            self._w(f"  time_sensitivity: {parse_result_dict.get('time_sensitivity', '?')}")
+            self._w(f"  follow_up_type: {parse_result_dict.get('follow_up_type')}")
+        self._w("<<< RouteLLM Output (规则推导) <<<")
         for k, v in result_dict.items():
             self._w(f"  {k}: {v}")
         self._w()
@@ -224,14 +237,16 @@ class PipelineTracer:
         filter_date_from: Optional[str] = None,
         filter_date_to: Optional[str] = None,
         reference_date: Optional[str] = None,
+        answer_scope_mode: Optional[str] = None,
     ):
         """[STEP 4] 检索结果（含时间参数、RRF 时间重排、正文全文）"""
         self._w(f"[STEP 4] 检索结果 | 共 {len(results)} 条")
         self._w(self._SUB)
         self._w("检索时间参数（传入向量库/检索层）:")
-        self._w(f"  filter_date_from : {filter_date_from or '-'}")
-        self._w(f"  filter_date_to   : {filter_date_to or '-'}")
-        self._w(f"  reference_date   : {reference_date or '-'}")
+        self._w(f"  filter_date_from    : {filter_date_from or '-'}")
+        self._w(f"  filter_date_to      : {filter_date_to or '-'}")
+        self._w(f"  reference_date      : {reference_date or '-'}")
+        self._w(f"  answer_scope_mode   : {answer_scope_mode or '-'}")
         if retrieval_mode:
             self._w(f"检索模式: {retrieval_mode}")
         self._w(f"检索查询: {search_queries}")
