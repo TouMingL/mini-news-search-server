@@ -24,6 +24,7 @@ from app.services.pipeline_modules.search_helpers import (
 from app.services.pipeline_modules.scores_formatter import (
     _format_scores_reply,                               # 将赛况数据格式化为比分播报文本
     _read_nba_scores_for_query,                         # 按日期与 query 读 NBA 比分并筛选场次
+    _slim_scores_context,                               # 按查询意图裁剪赛况数据供 LLM 生成答案用
 )
 from app.services.pipeline_modules.sse_utils import (
     _get_last_turn_user_input_from_history,             # 从历史取上一轮用户输入供改写
@@ -39,6 +40,7 @@ __all__ = [
     "_filter_by_semantic_score",
     "_filter_published_on_date",
     "_format_scores_reply",
+    "_slim_scores_context",
     "_get_last_turn_category",
     "_get_last_turn_user_input_from_history",
     "_get_retrieval_min_semantic_score",

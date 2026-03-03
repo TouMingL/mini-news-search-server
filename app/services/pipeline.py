@@ -46,6 +46,7 @@ from app.services.pipeline_modules import (
     _filter_by_semantic_score,
     _filter_published_on_date,
     _format_scores_reply,
+    _slim_scores_context,
     _get_last_turn_category,
     _get_last_turn_user_input_from_history,
     _get_retrieval_min_semantic_score,
@@ -846,6 +847,11 @@ class Pipeline:
         route_decision.search_params["player_filter"] = _player_filter if _player_filter else None
         route_decision.search_params["follow_up_time_type"] = getattr(route_llm_output, "follow_up_time_type", None)
         route_decision.search_params["answer_scope_date"] = answer_scope_date
+        route_decision.search_params["scores_intent"] = _parse_result.intent if _parse_result else None
+        route_decision.search_params["queried_teams"] = (
+            [e.value for e in _parse_result.entities if e.type == "team"]
+            if _parse_result else None
+        )
         tracer.record_route(
             action=route_decision.action,
             reason=route_decision.reason,
@@ -1220,10 +1226,24 @@ class Pipeline:
             ref_date    = temporal_context.reference_date if temporal_context else None
             cur_date    = ref_date or input_data.current_date or datetime.now().strftime("%Y-%m-%d")
             score_query = original_query or standalone_query or ""
-            data, was_filtered = _read_nba_scores_for_query(cur_date, score_query)
+            _intent     = (route_decision.search_params or {}).get("scores_intent")
+            _qt         = (route_decision.search_params or {}).get("queried_teams")
+            data, was_filtered = _read_nba_scores_for_query(cur_date, score_query, intent=_intent)
             want_detail = (route_decision.search_params or {}).get("detail_follow_up", False)
             _pf         = (route_decision.search_params or {}).get("player_filter")
-            answer      = _format_scores_reply(data, include_detail=was_filtered or want_detail, player_detail=want_detail, player_filter=_pf)
+            # 按查询意图裁剪数据，再交 LLM 生成精准答案
+            ctx      = _slim_scores_context(data, score_query, intent=_intent,
+                                            was_filtered=was_filtered, want_detail=want_detail,
+                                            player_filter=_pf, queried_teams=_qt)
+            messages = self._build_scores_answer_messages(score_query, ctx)
+            if tracer:
+                tracer.record_glm_prompt(
+                    system_prompt=messages[0]["content"],
+                    user_prompt=messages[1]["content"],
+                )
+            answer = self.llm_service.chat(messages, max_tokens=600)
+            if tracer:
+                tracer.record_glm_output(answer, verified=True)
             return answer, [], 0, None, None
 
         # Fallback：未知路由动作，按直接生成处理
@@ -1314,10 +1334,12 @@ class Pipeline:
                 try:
                     cur_date           = ref_date or input_data.current_date or datetime.now().strftime("%Y-%m-%d")
                     score_query        = original_query or standalone_query or ""
-                    data, was_filtered = _read_nba_scores_for_query(cur_date, score_query)
+                    _intent            = (route_decision.search_params or {}).get("scores_intent")
+                    _qt                = (route_decision.search_params or {}).get("queried_teams")
+                    data, was_filtered = _read_nba_scores_for_query(cur_date, score_query, intent=_intent)
                     want_detail        = search_params.get("detail_follow_up", False)
                     _pf                = search_params.get("player_filter")
-                    scores_text        = _format_scores_reply(data, include_detail=was_filtered or want_detail, player_detail=want_detail, player_filter=_pf)
+                    scores_text        = _format_scores_reply(data, include_detail=was_filtered or want_detail, player_detail=want_detail, player_filter=_pf, queried_teams=_qt)
                     search_results.append({
                         "title":  "NBA比分",
                         "source": "赛况数据引擎",
@@ -1456,11 +1478,27 @@ class Pipeline:
             ref_date           = temporal_context.reference_date if temporal_context else None
             cur_date           = ref_date or input_data.current_date or datetime.now().strftime("%Y-%m-%d")
             score_query        = original_query or standalone_query or ""
-            data, was_filtered = _read_nba_scores_for_query(cur_date, score_query)
+            _intent            = (route_decision.search_params or {}).get("scores_intent")
+            _qt                = (route_decision.search_params or {}).get("queried_teams")
+            data, was_filtered = _read_nba_scores_for_query(cur_date, score_query, intent=_intent)
             want_detail        = (route_decision.search_params or {}).get("detail_follow_up", False)
             _pf                = (route_decision.search_params or {}).get("player_filter")
-            answer             = _format_scores_reply(data, include_detail=was_filtered or want_detail, player_detail=want_detail, player_filter=_pf)
-            yield _sanitize_event({"choices": [{"delta": {"content": answer}}]})
+            # 按查询意图裁剪数据，再流式交 LLM 生成精准答案
+            ctx      = _slim_scores_context(data, score_query, intent=_intent,
+                                            was_filtered=was_filtered, want_detail=want_detail,
+                                            player_filter=_pf, queried_teams=_qt)
+            messages = self._build_scores_answer_messages(score_query, ctx)
+            if tracer:
+                tracer.record_glm_prompt(
+                    system_prompt=messages[0]["content"],
+                    user_prompt=messages[1]["content"],
+                )
+            raw_chunks: List[str] = []
+            for chunk in self.llm_service.chat_stream(messages, max_tokens=600):
+                raw_chunks.append(chunk)
+                yield _sanitize_event({"choices": [{"delta": {"content": chunk}}]})
+            if tracer:
+                tracer.record_glm_output("".join(raw_chunks), verified=True)
             yield _sanitize_event({"sources": [], "done": True})
         else:
             # generate_direct / unknown action -> 直接生成（带历史或仅新消息）
@@ -1568,10 +1606,12 @@ class Pipeline:
             try:
                 cur_date           = ref_date or input_data.current_date or datetime.now().strftime("%Y-%m-%d")
                 score_query        = original_query or standalone_query or ""
-                data, was_filtered = _read_nba_scores_for_query(cur_date, score_query)
+                _intent            = (route_decision.search_params or {}).get("scores_intent")
+                _qt                = (route_decision.search_params or {}).get("queried_teams")
+                data, was_filtered = _read_nba_scores_for_query(cur_date, score_query, intent=_intent)
                 want_detail        = search_params.get("detail_follow_up", False)
                 _pf                = search_params.get("player_filter")
-                scores_text        = _format_scores_reply(data, include_detail=was_filtered or want_detail, player_detail=want_detail, player_filter=_pf)
+                scores_text        = _format_scores_reply(data, include_detail=was_filtered or want_detail, player_detail=want_detail, player_filter=_pf, queried_teams=_qt)
                 search_results.append({
                     "title":  "NBA比分",
                     "source": "赛况数据引擎",
@@ -1724,6 +1764,32 @@ class Pipeline:
             )
         answer = self.llm_service.chat(messages)
         return answer, [], 0
+
+    @staticmethod
+    def _build_scores_answer_messages(
+        query: str,
+        scores_context: str,
+    ) -> List[Dict[str, str]]:
+        """
+        基于已裁剪的赛况数据上下文构建 LLM 消息，用于生成针对用户问题的精准回答。
+
+        系统提示要求 LLM 仅凭提供的数据作答，直接回答问题，不展示冗余数据，不编造。
+        """
+        system = (
+            "你叫菠萝包，是专业的 NBA 数据播报助手。\n"
+            "规则（严格遵守）：\n"
+            "1. 只基于下方「赛况数据」回答，严禁使用训练知识补充任何数据。\n"
+            "2. 直接回答用户问题，不重复列出与问题无关的条目。\n"
+            "3. 回答时把命中条目的关键数据一并带出（战绩、胜率、连胜/连败、得分等），"
+            "让用户一句话获得完整信息，但不要罗列无关条目。\n"
+            "4. 数据不足以回答时，如实说明「当前数据不足以回答该问题」。\n"
+            "5. 用中文作答，一两句话说清楚。"
+        )
+        user = f"赛况数据：\n{scores_context}\n\n用户问题：{query}"
+        return [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ]
 
     @staticmethod
     def _build_chat_messages(

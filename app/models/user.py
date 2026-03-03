@@ -9,14 +9,14 @@ class UserProfile(db.Model):
     """用户资料模型，业务主键为 _openid"""
     __tablename__ = 'user_profile'
 
-    openid = db.Column('_openid', db.String(128), primary_key=True)
-    nick_name = db.Column(db.String(128), nullable=False)
-    avatar_url = db.Column(db.String(512), nullable=True)
-    join_time = db.Column(db.BigInteger, nullable=False)
-    agent_count = db.Column(db.Integer, default=0)
-    conversation_count = db.Column(db.Integer, default=0)
-    updated_at = db.Column(db.BigInteger, nullable=True)
-    selected_agent = db.Column(db.Text, nullable=True)  # JSON: { id, name, avatar, description, bgClass } or null
+    openid             = db.Column('_openid', db.String(128), primary_key=True)
+    nick_name          = db.Column(db.String(128), nullable=False)
+    avatar_url         = db.Column(db.String(512), nullable=True)
+    join_time          = db.Column(db.BigInteger,  nullable=False)
+    agent_count        = db.Column(db.Integer,     default=0)
+    conversation_count = db.Column(db.Integer,     default=0)
+    updated_at         = db.Column(db.BigInteger,  nullable=True)
+    selected_agent     = db.Column(db.Text,        nullable=True)  # JSON: { id, name, avatar, description, bgClass } or null
 
     def __repr__(self):
         return f'<UserProfile {self.openid}>'
@@ -35,11 +35,11 @@ class UserProfile(db.Model):
             except (TypeError, ValueError):
                 pass
         return {
-            'openid': self.openid,
-            'nickName': self.nick_name,
-            'avatarUrl': self.avatar_url,
-            'joinDate': join_date_str,
-            'agentCount': self.agent_count,
+            'openid':            self.openid,
+            'nickName':          self.nick_name,
+            'avatarUrl':         self.avatar_url,
+            'joinDate':          join_date_str,
+            'agentCount':        self.agent_count,
             'conversationCount': self.conversation_count,
-            'selectedAgent': selected_agent_val,
+            'selectedAgent':     selected_agent_val,
         }

@@ -118,6 +118,7 @@ QueryIntentType = Literal[
     "scores",         # 比分/赛果/几比几
     "player_stats",   # 球员数据/详细统计
     "game_detail",    # 比赛细节/打得怎么样
+    "standings",      # 排名/战绩/胜负/分区排名
     "news",           # 新闻/报道/动态
     "realtime_quote", # 实时行情/价格
     "general_query",  # 一般信息查询
@@ -191,7 +192,7 @@ class RouteLLMOutput(BaseModel):
 
 def classification_from_route_output(route: RouteLLMOutput) -> "ClassificationResult":
     """由 RouteLLMOutput 构造 ClassificationResult；action 由 Router 根据 need_retrieval/need_scores 推导。"""
-    action = _action_from_intent(route.need_retrieval, route.need_scores)
+    action      = _action_from_intent(route.need_retrieval, route.need_scores)
     intent_type = "tool_scores" if action == "tool_scores" else ("news" if route.need_retrieval else "knowledge")
     return ClassificationResult(
         needs_search=route.need_retrieval,

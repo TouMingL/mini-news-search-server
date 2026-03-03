@@ -18,7 +18,7 @@ from app.services.local_llm_service import get_local_llm_service
 
 # ============ 规则层：QueryParseResult → RouteLLMOutput ============
 
-_SCORES_INTENTS = {"scores", "player_stats", "game_detail"}
+_SCORES_INTENTS = {"scores", "player_stats", "game_detail", "standings"}
 
 
 def derive_route_output(parsed: QueryParseResult) -> RouteLLMOutput:
@@ -70,6 +70,7 @@ _PARSER_SYSTEM = """你是查询解析器。从用户句中提取实体、识别
 - scores：要比分/赛果/几比几
 - player_stats：要球员数据/详细统计
 - game_detail：要比赛详情/打得怎么样/比赛细节
+- standings：要排名/战绩/胜负/分区排名
 - news：要新闻/报道/动态/发生了什么
 - realtime_quote：要实时行情/价格
 - general_query：一般信息查询
@@ -91,7 +92,7 @@ sports / economy / tech / world / health / academic / general
 
 只输出一行 JSON，无解释。"""
 
-_PARSER_SYSTEM_SHORT = """查询解析器。提取entities(type:team/player/league/sport_type/financial/time/location/person/org/other,value)、intent(scores/player_stats/game_detail/news/realtime_quote/general_query/chitchat)、category(sports/economy/tech/world/health/academic/general)、time_sensitivity(realtime/recent/historical/none)、follow_up_type(time_switch/event_continue/object_switch/null)。只输出JSON。"""
+_PARSER_SYSTEM_SHORT = """查询解析器。提取entities(type:team/player/league/sport_type/financial/time/location/person/org/other,value)、intent(scores/player_stats/game_detail/standings/news/realtime_quote/general_query/chitchat)、category(sports/economy/tech/world/health/academic/general)、time_sensitivity(realtime/recent/historical/none)、follow_up_type(time_switch/event_continue/object_switch/null)。只输出JSON。"""
 
 _FEW_SHOT_EXAMPLES = [
     ("昨天湖人詹姆斯数据", "无",
@@ -104,6 +105,8 @@ _FEW_SHOT_EXAMPLES = [
      '{"entities":[{"type":"time","value":"明天"}],"intent":"game_detail","category":"sports","time_sensitivity":"recent","follow_up_type":"time_switch"}'),
     ("最近英超有什么新闻", "无",
      '{"entities":[{"type":"time","value":"最近"},{"type":"league","value":"英超"}],"intent":"news","category":"sports","time_sensitivity":"recent","follow_up_type":null}'),
+    ("东部排名", "无",
+     '{"entities":[{"type":"league","value":"NBA"}],"intent":"standings","category":"sports","time_sensitivity":"recent","follow_up_type":null}'),
     ("白银现在什么价", "无",
      '{"entities":[{"type":"financial","value":"白银"}],"intent":"realtime_quote","category":"economy","time_sensitivity":"realtime","follow_up_type":null}'),
     ("你好", "无",
@@ -115,6 +118,8 @@ _FEW_SHOT_MINIMAL = [
      '{"entities":[{"type":"time","value":"昨天"},{"type":"team","value":"湖人"},{"type":"player","value":"詹姆斯"}],"intent":"player_stats","category":"sports","time_sensitivity":"recent","follow_up_type":null}'),
     ("再详细点", "sports",
      '{"entities":[],"intent":"game_detail","category":"sports","time_sensitivity":"recent","follow_up_type":"event_continue"}'),
+    ("东部排名", "无",
+     '{"entities":[{"type":"league","value":"NBA"}],"intent":"standings","category":"sports","time_sensitivity":"recent","follow_up_type":null}'),
     ("白银现在什么价", "无",
      '{"entities":[{"type":"financial","value":"白银"}],"intent":"realtime_quote","category":"economy","time_sensitivity":"realtime","follow_up_type":null}'),
     ("你好", "无",

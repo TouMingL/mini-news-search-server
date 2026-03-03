@@ -67,7 +67,7 @@ def _resolve_last_week_range(ref: datetime) -> tuple[str, str]:
 def _resolve_last_month_range(ref: datetime) -> tuple[str, str]:
     """解析「上个月/上月」为日期范围：上月 1 日 ~ 上月最后一天。"""
     first_this_month = ref.replace(day=1)
-    last_last_month = first_this_month - timedelta(days=1)
+    last_last_month  = first_this_month - timedelta(days=1)
     first_last_month = last_last_month.replace(day=1)
     return first_last_month.strftime("%Y-%m-%d"), last_last_month.strftime("%Y-%m-%d")
 
@@ -77,9 +77,9 @@ def _get_date_range_for_single_day(reference_date: str, buffer_days: int = 1) ->
     为单日查询生成检索用日期窗口。
     报道可能在前一日或后一日发布，故前后各加 buffer_days 天。
     """
-    dt = datetime.strptime(reference_date, "%Y-%m-%d")
+    dt      = datetime.strptime(reference_date, "%Y-%m-%d")
     dt_from = dt - timedelta(days=buffer_days)
-    dt_to = dt + timedelta(days=buffer_days)
+    dt_to   = dt + timedelta(days=buffer_days)
     return dt_from.strftime("%Y-%m-%d"), dt_to.strftime("%Y-%m-%d")
 
 

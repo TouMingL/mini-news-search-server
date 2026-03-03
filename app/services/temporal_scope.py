@@ -22,7 +22,7 @@ from app.services.schemas import (
 
 def compute_answer_scope_date(
     temporal_context: Optional[TemporalContext],
-    follow_up_type: Optional[FollowUpType],
+    follow_up_type:   Optional[FollowUpType],
 ) -> Optional[str]:
     """
     计算本问的「回答范围日期」：回答是否必须限定在某一日。
@@ -129,8 +129,8 @@ def compute_answer_scope_mode(
 
 def compute_retrieval_scope(
     temporal_context: Optional[TemporalContext],
-    follow_up_type: Optional[FollowUpType],
-    time_intent: Optional[TimeIntent],
+    follow_up_type:   Optional[FollowUpType],
+    time_intent:      Optional[TimeIntent],
     time_sensitivity: str = "none",
 ) -> Dict[str, Any]:
     """
@@ -157,27 +157,27 @@ def compute_retrieval_scope(
     if resolved and time_intent and has_date_range and not use_object_switch_window:
         ref_type = time_intent.time_reference_type
         if ref_type == "publish_time":
-            params["time_filter_strategy"] = "publish_time_only"
-            params["filter_date_from"] = temporal_context.date_range_from
-            params["filter_date_to"] = temporal_context.date_range_to
+            params["time_filter_strategy"]   = "publish_time_only"
+            params["filter_date_from"]       = temporal_context.date_range_from
+            params["filter_date_to"]         = temporal_context.date_range_to
         elif ref_type == "event_time":
-            params["time_filter_strategy"] = "event_time_with_fallback"
+            params["time_filter_strategy"]   = "event_time_with_fallback"
             params["filter_event_time_from"] = temporal_context.reference_date
-            params["filter_event_time_to"] = temporal_context.reference_date
+            params["filter_event_time_to"]   = temporal_context.reference_date
             ref_dt = datetime.strptime(temporal_context.reference_date, "%Y-%m-%d")
-            params["filter_date_from"] = temporal_context.reference_date
-            params["filter_date_to"] = (ref_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+            params["filter_date_from"]       = temporal_context.reference_date
+            params["filter_date_to"]         = (ref_dt + timedelta(days=1)).strftime("%Y-%m-%d")
         elif ref_type == "ambiguous":
-            params["time_filter_strategy"] = "publish_time_only"
-            params["filter_date_from"] = temporal_context.date_range_from
-            params["filter_date_to"] = temporal_context.date_range_to
+            params["time_filter_strategy"]   = "publish_time_only"
+            params["filter_date_from"]       = temporal_context.date_range_from
+            params["filter_date_to"]         = temporal_context.date_range_to
         else:
-            params["filter_date_from"] = temporal_context.date_range_from
-            params["filter_date_to"] = temporal_context.date_range_to
+            params["filter_date_from"]       = temporal_context.date_range_from
+            params["filter_date_to"]         = temporal_context.date_range_to
     elif has_date_range:
         # object_switch 等追问继承到的事件日也使用该范围，不再退化为 recent
         params["filter_date_from"] = temporal_context.date_range_from
-        params["filter_date_to"] = temporal_context.date_range_to
+        params["filter_date_to"]   = temporal_context.date_range_to
     else:
         today = datetime.now()
         if time_sensitivity == "realtime":

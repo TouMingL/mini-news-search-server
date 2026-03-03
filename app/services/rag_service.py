@@ -27,8 +27,8 @@ class RAGService:
         pipeline = None
     ):
         self.vector_store = vector_store or VectorStore()
-        self.llm_service = llm_service or LLMService()
-        self._pipeline = pipeline
+        self.llm_service  = llm_service or LLMService()
+        self._pipeline    = pipeline
     
     @property
     def pipeline(self):
@@ -42,10 +42,10 @@ class RAGService:
         self,
         query: str,
         top_k: int = 5,
-        filter_source: Optional[str] = None,
-        filter_category: Optional[str] = None,
+        filter_source:    Optional[str] = None,
+        filter_category:  Optional[str] = None,
         filter_date_from: Optional[str] = None,
-        filter_date_to: Optional[str] = None
+        filter_date_to:   Optional[str] = None
     ) -> Dict:
         """
         执行RAG查询（传统模式，保持向后兼容）
@@ -138,14 +138,14 @@ class RAGService:
     def query_with_pipeline(
         self,
         query: str,
-        conversation_id: Optional[str] = None,
+        conversation_id:  Optional[str] = None,
         history_turns: int = 5,
-        current_date: Optional[str] = None,
+        current_date:     Optional[str] = None,
         top_k: int = 5,
-        filter_source: Optional[str] = None,
-        filter_category: Optional[str] = None,
+        filter_source:    Optional[str] = None,
+        filter_category:  Optional[str] = None,
         filter_date_from: Optional[str] = None,
-        filter_date_to: Optional[str] = None
+        filter_date_to:   Optional[str] = None
     ) -> Dict:
         """
         使用 Pipeline 执行RAG查询（支持多轮对话）
@@ -196,14 +196,14 @@ class RAGService:
     def query_with_pipeline_stream(
         self,
         query: str,
-        conversation_id: Optional[str] = None,
+        conversation_id:  Optional[str] = None,
         history_turns: int = 5,
-        current_date: Optional[str] = None,
+        current_date:     Optional[str] = None,
         top_k: int = 5,
-        filter_source: Optional[str] = None,
-        filter_category: Optional[str] = None,
+        filter_source:    Optional[str] = None,
+        filter_category:  Optional[str] = None,
         filter_date_from: Optional[str] = None,
-        filter_date_to: Optional[str] = None
+        filter_date_to:   Optional[str] = None
     ) -> Iterator[Dict]:
         """流式执行 Pipeline，yield SSE 事件 dict（与 OpenAI 兼容的 content / replace / done）。"""
         from app.services.schemas import PipelineInput

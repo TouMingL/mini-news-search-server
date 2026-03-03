@@ -117,7 +117,7 @@ def append_messages(chat_id):
             pass
 
     try:
-        conv = Conversation.query.filter_by(chat_id=chat_id).first()
+        conv = Conversation.query.filter_by(chat_id=chat_id, openid=openid).first()
         if not conv:
             conv = Conversation(
                 openid=openid,

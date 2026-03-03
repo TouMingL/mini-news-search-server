@@ -132,7 +132,7 @@ class Router:
 
         # 无意义查询：若要走检索但查询无效，改为直接生成（仅覆盖决策 action，不改 route 输出）
         need_retrieval = getattr(route_llm_output, "need_retrieval", False)
-        need_scores = getattr(route_llm_output, "need_scores", False)
+        need_scores    = getattr(route_llm_output, "need_scores", False)
         if need_retrieval and _is_meaningless_for_search(standalone_query):
             return _log_and_return(RouteDecision(
                 action="generate_direct",
@@ -216,19 +216,19 @@ class Router:
 
     def route_and_update_state(
         self,
-        route_llm_output: RouteLLMOutput,
-        route_decision: RouteDecision,
-        conversation_id: str,
-        standalone_query: str,
-        temporal_context: Optional[TemporalContext] = None,
-        time_intent: Optional[TimeIntent] = None,
+        route_llm_output:        RouteLLMOutput,
+        route_decision:          RouteDecision,
+        conversation_id:         str,
+        standalone_query:        str,
+        temporal_context:        Optional[TemporalContext] = None,
+        time_intent:             Optional[TimeIntent] = None,
         effective_last_category: Optional[str] = None,
     ) -> tuple[RouteDecision, SessionState]:
         """
         一次完成：取 state -> decide -> 用 RouteLLM 输出更新 state。
         与 decide() 一致：effective_last_category 由调用方从当前请求 history 推断传入，用于上下文漂移重置 search_count；未传则视为无上轮类别。
         """
-        state = self.state_manager.get_state(conversation_id)
+        state    = self.state_manager.get_state(conversation_id)
         decision = self.decide(
             route_llm_output,
             state,
@@ -238,7 +238,7 @@ class Router:
             effective_last_category=effective_last_category,
         )
         classification = classification_from_route_output(route_llm_output)
-        updated_state = self.state_manager.update_state(
+        updated_state  = self.state_manager.update_state(
             conversation_id=conversation_id,
             classification=classification,
             route_action=decision.action

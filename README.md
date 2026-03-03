@@ -62,6 +62,11 @@ FLASK_ENV=development
 DATABASE_URL=sqlite:///database.db
 FLASK_HOST=0.0.0.0
 FLASK_PORT=8081
+
+# NBA 数据源（按日期子目录组织）
+NBA_BOXSCORE_ROOT=/path/to/parsed_boxscore
+NBA_SCORES_ROOT=/path/to/sohu_nba_block4_scores
+NBA_STANDINGS_ROOT=/path/to/sohu_nba_standings
 ```
 
 ## 启动服务器

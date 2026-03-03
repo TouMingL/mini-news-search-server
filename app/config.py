@@ -86,9 +86,10 @@ class Config:
     # 混合检索时 sparse 向量在 Qdrant 中的名称
     RETRIEVAL_SPARSE_VECTOR_NAME = os.getenv('RETRIEVAL_SPARSE_VECTOR_NAME', 'sparse')
 
-    # NBA 比分/详细数据：旧版单文件比分；新版按日期的 parsed_boxscore 目录（含节次、球员等）
-    NBA_SCORES_JSON_PATH = os.getenv('NBA_SCORES_JSON_PATH', '')
-    NBA_BOXSCORE_ROOT = os.getenv('NBA_BOXSCORE_ROOT', r'C:\Users\HX\Documents\KP\news-search\data\parsed_boxscore')
+    # NBA 数据源：三个目录分别存储不同粒度的赛况数据（按日期子目录组织）
+    NBA_BOXSCORE_ROOT = os.getenv('NBA_BOXSCORE_ROOT', '')
+    NBA_SCORES_ROOT = os.getenv('NBA_SCORES_ROOT', '')
+    NBA_STANDINGS_ROOT = os.getenv('NBA_STANDINGS_ROOT', '')
 
 
 class DevelopmentConfig(Config):

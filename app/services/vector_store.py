@@ -25,7 +25,7 @@ from app.utils.text_encoding import normalize_text, safe_for_display
 
 # 用于去重的标点 / 空白正则
 _DEDUP_STRIP_RE = re.compile(r'[\s，,、;；：:。.!！？?""\'\'「」【】《》\-—\u3000]+')
-_HTML_TAG_RE = re.compile(r'<[^>]+>')
+_HTML_TAG_RE    = re.compile(r'<[^>]+>')
 
 
 def _parent_source(source: str) -> str:
@@ -45,10 +45,10 @@ def make_dedup_key(item: Dict) -> str:
     同大源、同标题视为同一结果（不同细分如 金十-黄金/金十-钯金 合并）。
     去除 HTML 标签、标点、空白后的 title + 大源。
     """
-    title = item.get("title") or ""
+    title  = item.get("title") or ""
     source = item.get("source") or ""
-    title = _HTML_TAG_RE.sub("", title)
-    title = _DEDUP_STRIP_RE.sub("", title)
+    title  = _HTML_TAG_RE.sub("", title)
+    title  = _DEDUP_STRIP_RE.sub("", title)
     parent = _parent_source(source)
     return title + parent
 
@@ -69,7 +69,7 @@ class VectorStore:
     """向量数据库服务"""
     
     _instance = None
-    _client = None
+    _client   = None
     
     def __new__(cls, embedding_service: EmbeddingService = None):
         """单例模式"""
@@ -108,9 +108,9 @@ class VectorStore:
     def _ensure_collection(self):
         """确保集合存在；若不存在则创建。启用混合检索时新集合将包含 dense + sparse 向量配置。"""
         try:
-            collections = self.client.get_collections().collections
+            collections      = self.client.get_collections().collections
             collection_names = [c.name for c in collections]
-            hybrid = _get_hybrid_config()
+            hybrid           = _get_hybrid_config()
 
             if self.collection_name not in collection_names:
                 logger.info(f"创建向量集合: {self.collection_name}")
@@ -181,15 +181,15 @@ class VectorStore:
     
     def search(
         self,
-        query_text: str,
-        top_k: int = 5,
-        filter_source: Optional[str] = None,
-        filter_category: Optional[str] = None,
-        filter_categories: Optional[List[str]] = None,
-        filter_date_from: Optional[str] = None,
-        filter_date_to: Optional[str] = None,
+        query_text:             str,
+        top_k:                  int = 5,
+        filter_source:          Optional[str] = None,
+        filter_category:        Optional[str] = None,
+        filter_categories:      Optional[List[str]] = None,
+        filter_date_from:       Optional[str] = None,
+        filter_date_to:         Optional[str] = None,
         filter_event_time_from: Optional[str] = None,
-        filter_event_time_to: Optional[str] = None,
+        filter_event_time_to:   Optional[str] = None,
     ) -> List[Dict]:
         """
         向量搜索，支持 source、category、日期 range 过滤。
@@ -301,10 +301,10 @@ class VectorStore:
         hybrid_reason = ""
         if hybrid_cfg["enabled"] and hybrid_cfg["dense_name"]:
             try:
-                coll = self.client.get_collection(self.collection_name)
+                coll          = self.client.get_collection(self.collection_name)
                 sparse_params = getattr(getattr(coll, "config", None), "params", None)
-                has_sparse = sparse_params and getattr(sparse_params, "sparse_vectors", None)
-                query_sparse = self.embedding_service.encode_query_sparse(query_text)
+                has_sparse    = sparse_params and getattr(sparse_params, "sparse_vectors", None)
+                query_sparse  = self.embedding_service.encode_query_sparse(query_text)
                 if has_sparse and query_sparse:
                     use_hybrid = True
                 elif not has_sparse:
@@ -329,7 +329,7 @@ class VectorStore:
         try:
             if use_hybrid:
                 indices, values = query_sparse
-                sparse_vec = SparseVector(indices=indices, values=values)
+                sparse_vec      = SparseVector(indices=indices, values=values)
                 response = self.client.query_points(
                     collection_name=self.collection_name,
                     prefetch=[
@@ -360,8 +360,8 @@ class VectorStore:
                 results = response.points or []
             
             # 两级去重（同 news_id 只保留最相关 chunk；同大源+同标题只保留一条）
-            search_results = []
-            seen_news_ids = set()
+            search_results  = []
+            seen_news_ids   = set()
             seen_dedup_keys = set()
             
             for result in results:
@@ -376,11 +376,11 @@ class VectorStore:
                 raw = lambda k: safe_for_display(normalize_text(payload.get(k)))
                 item = {
                     "score": result.score,
-                    "title": raw("title"),
-                    "content": raw("content") or "",
-                    "source": raw("source"),
+                    "title":    raw("title"),
+                    "content":  raw("content") or "",
+                    "source":   raw("source"),
                     "category": raw("category"),
-                    "link": raw("link"),
+                    "link":     raw("link"),
                     "published_time": raw("published_time"),
                     "chunk_index": payload.get("chunk_index", 0),
                 }
@@ -403,9 +403,9 @@ class VectorStore:
                 if len(search_results) >= top_k:
                     break
 
-            elapsed_ms = (time.perf_counter() - t0) * 1000
+            elapsed_ms      = (time.perf_counter() - t0) * 1000
             results_preview = query_text[:40] + "..." if len(query_text) > 40 else query_text
-            mode = "dense+sparse" if use_hybrid else "dense-only"
+            mode            = "dense+sparse" if use_hybrid else "dense-only"
             logger.info(
                 f"[VectorStore.search] 完成: mode={mode}, query_preview={repr(results_preview)}, "
                 f"results={len(search_results)}, elapsed_ms={elapsed_ms:.2f}"
@@ -418,17 +418,17 @@ class VectorStore:
 
     def search_with_expansion(
         self,
-        queries: List[str],
-        top_k: int = 5,
-        filter_source: Optional[str] = None,
-        filter_category: Optional[str] = None,
-        filter_categories: Optional[List[str]] = None,
-        filter_date_from: Optional[str] = None,
-        filter_date_to: Optional[str] = None,
+        queries:                List[str],
+        top_k:                  int = 5,
+        filter_source:          Optional[str] = None,
+        filter_category:        Optional[str] = None,
+        filter_categories:      Optional[List[str]] = None,
+        filter_date_from:       Optional[str] = None,
+        filter_date_to:         Optional[str] = None,
         filter_event_time_from: Optional[str] = None,
-        filter_event_time_to: Optional[str] = None,
-        fallback_query: Optional[str] = None,
-        score_threshold: float = 0.3
+        filter_event_time_to:   Optional[str] = None,
+        fallback_query:         Optional[str] = None,
+        score_threshold:        float = 0.3
     ) -> List[Dict]:
         """
         多查询扩展搜索：对多个查询变体分别检索，合并去重，空结果时 fallback。
