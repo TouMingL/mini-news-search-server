@@ -3,6 +3,8 @@
 路由小 LLM（Query Parser 架构）
 职责分离：LLM 做结构化理解（实体提取 + 意图识别），规则层做确定性路由推导。
 下游 Router / Pipeline 仍消费 RouteLLMOutput，零改动。
+
+模型选择策略：上下文放得进 Qwen -> 本地推理；放不进 -> GLM。
 """
 import os
 from typing import Optional
@@ -92,8 +94,6 @@ sports / economy / tech / world / health / academic / general
 
 只输出一行 JSON，无解释。"""
 
-_PARSER_SYSTEM_SHORT = """查询解析器。提取entities(type:team/player/league/sport_type/financial/time/location/person/org/other,value)、intent(scores/player_stats/game_detail/standings/news/realtime_quote/general_query/chitchat)、category(sports/economy/tech/world/health/academic/general)、time_sensitivity(realtime/recent/historical/none)、follow_up_type(time_switch/event_continue/object_switch/null)。只输出JSON。"""
-
 _FEW_SHOT_EXAMPLES = [
     ("昨天湖人詹姆斯数据", "无",
      '{"entities":[{"type":"time","value":"昨天"},{"type":"team","value":"湖人"},{"type":"player","value":"詹姆斯"}],"intent":"player_stats","category":"sports","time_sensitivity":"recent","follow_up_type":null}'),
@@ -113,25 +113,10 @@ _FEW_SHOT_EXAMPLES = [
      '{"entities":[],"intent":"chitchat","category":"general","time_sensitivity":"none","follow_up_type":null}'),
 ]
 
-_FEW_SHOT_MINIMAL = [
-    ("昨天湖人詹姆斯数据", "无",
-     '{"entities":[{"type":"time","value":"昨天"},{"type":"team","value":"湖人"},{"type":"player","value":"詹姆斯"}],"intent":"player_stats","category":"sports","time_sensitivity":"recent","follow_up_type":null}'),
-    ("再详细点", "sports",
-     '{"entities":[],"intent":"game_detail","category":"sports","time_sensitivity":"recent","follow_up_type":"event_continue"}'),
-    ("东部排名", "无",
-     '{"entities":[{"type":"league","value":"NBA"}],"intent":"standings","category":"sports","time_sensitivity":"recent","follow_up_type":null}'),
-    ("白银现在什么价", "无",
-     '{"entities":[{"type":"financial","value":"白银"}],"intent":"realtime_quote","category":"economy","time_sensitivity":"realtime","follow_up_type":null}'),
-    ("你好", "无",
-     '{"entities":[],"intent":"chitchat","category":"general","time_sensitivity":"none","follow_up_type":null}'),
-]
-
 _FEW_SHOT_USER = """用户：「{user}」
 上轮类别：{last_cat}
 
 输出 JSON："""
-
-_FEW_SHOT_LINE = "用户:{user} 上轮:{last_cat} -> {out}"
 
 
 # ============ Prompt 构建工具 ============
@@ -154,32 +139,24 @@ def _get_max_context_tokens() -> int:
     return int(os.environ.get("LOCAL_LLM_MAX_CONTEXT_TOKENS", "864"))
 
 
-def _use_abbreviated_prompt(system: str, user_content: str, max_tokens: int = 256) -> bool:
-    """是否使用缩写版 prompt：system+user 估计 token 数超过 (模型上限 - max_tokens) 时用缩写。"""
+def _context_exceeds_local_limit(system: str, user_content: str, max_tokens: int = 256) -> bool:
+    """判断 system + user 是否超出本地模型上下文容量。"""
     limit = _get_max_context_tokens()
     total_input = _estimate_tokens(system) + _estimate_tokens(user_content)
     return total_input + max_tokens > limit
 
 
-def _build_few_shot_block(abbreviated: bool = False) -> str:
-    examples = _FEW_SHOT_MINIMAL if abbreviated else _FEW_SHOT_EXAMPLES
-    if abbreviated:
-        return "\n".join(
-            _FEW_SHOT_LINE.format(user=u, last_cat=c, out=o)
-            for u, c, o in examples
-        )
+def _build_few_shot_block() -> str:
     lines = []
-    for user, last_cat, out in examples:
+    for user, last_cat, out in _FEW_SHOT_EXAMPLES:
         lines.append(_FEW_SHOT_USER.format(user=user, last_cat=last_cat).strip())
         lines.append(out)
     return "\n".join(lines)
 
 
-def _build_user_message(current_utterance: str, last_filter_category: Optional[str], abbreviated: bool = False) -> str:
+def _build_user_message(current_utterance: str, last_filter_category: Optional[str]) -> str:
     last_cat = last_filter_category if last_filter_category else "无"
-    block = _build_few_shot_block(abbreviated=abbreviated)
-    if abbreviated:
-        return f"{block}\n用户:{current_utterance} 上轮:{last_cat} ->"
+    block = _build_few_shot_block()
     return f"""{block}
 
 用户：「{current_utterance}」
@@ -193,12 +170,13 @@ def _build_user_message(current_utterance: str, last_filter_category: Optional[s
 class RouteLLM:
     """
     路由 LLM（Query Parser 架构）：
-    LLM 输出结构化理解 QueryParseResult → 规则层 derive_route_output() 推导 RouteLLMOutput。
-    对外接口不变，返回 RouteLLMOutput。
+    LLM 输出结构化理解 QueryParseResult -> 规则层 derive_route_output() 推导 RouteLLMOutput。
+    上下文放得进 Qwen 用本地推理，放不进用 GLM。
     """
 
     def __init__(self, local_llm_service=None):
         self._local_llm = local_llm_service
+        self._glm = None
         self._last_parse_result: Optional[QueryParseResult] = None
 
     @property
@@ -206,6 +184,14 @@ class RouteLLM:
         if self._local_llm is None:
             self._local_llm = get_local_llm_service()
         return self._local_llm
+
+    @property
+    def glm(self):
+        """多轮对话上下文超出本地模型容量时使用的远程 GLM 服务。"""
+        if self._glm is None:
+            from app.services.llm_service import LLMService
+            self._glm = LLMService(local_llm_service=self.local_llm)
+        return self._glm
 
     @property
     def last_parse_result(self) -> Optional[QueryParseResult]:
@@ -218,52 +204,68 @@ class RouteLLM:
         last_filter_category: Optional[str] = None,
     ) -> RouteLLMOutput:
         """
-        Parser LLM 提取实体+意图 → 规则层推导路由布尔值 → 返回 RouteLLMOutput。
+        Parser LLM 提取实体+意图 -> 规则层推导路由布尔值 -> 返回 RouteLLMOutput。
+        上下文放得进本地 Qwen 用本地，放不进切 GLM。
         """
         self._last_parse_result = None
-        user_content_full = _build_user_message(
+        user_content = _build_user_message(
             current_user_utterance.strip(),
             last_filter_category,
-            abbreviated=False,
         )
-        use_short = _use_abbreviated_prompt(_PARSER_SYSTEM, user_content_full, max_tokens=256)
-        if use_short:
-            system_content = _PARSER_SYSTEM_SHORT
-            user_content = _build_user_message(
-                current_user_utterance.strip(),
-                last_filter_category,
-                abbreviated=True,
-            )
-            logger.debug("RouteLLM 使用缩写 prompt（估计 token 超限）")
+
+        if _context_exceeds_local_limit(_PARSER_SYSTEM, user_content, max_tokens=256):
+            logger.debug("QueryParser 上下文超出本地模型容量，使用 GLM")
+            parsed = self._parse_with_glm(user_content)
         else:
-            system_content = _PARSER_SYSTEM
-            user_content = user_content_full
+            parsed = self._parse_with_local(user_content)
+
+        self._last_parse_result = parsed
+        result = derive_route_output(parsed)
+        action = _action_from_intent(result.need_retrieval, result.need_scores)
+        logger.debug(
+            "QueryParser entities=%s intent=%s -> need_retrieval=%s need_scores=%s action=%s",
+            [(e.type, e.value) for e in parsed.entities],
+            parsed.intent,
+            result.need_retrieval,
+            result.need_scores,
+            action,
+        )
+        return result
+
+    def _parse_with_local(self, user_content: str) -> QueryParseResult:
+        """本地 Qwen 结构化输出。"""
         messages = [
-            {"role": "system", "content": system_content},
+            {"role": "system", "content": _PARSER_SYSTEM},
             {"role": "user", "content": user_content},
         ]
-        try:
-            parsed = self.local_llm.chat_with_schema(
-                messages=messages,
-                response_schema=QueryParseResult,
-                temperature=0.0,
-                max_tokens=256,
-            )
-            self._last_parse_result = parsed
-            result = derive_route_output(parsed)
-            action = _action_from_intent(result.need_retrieval, result.need_scores)
-            logger.debug(
-                "QueryParser entities=%s intent=%s -> need_retrieval=%s need_scores=%s action=%s",
-                [(e.type, e.value) for e in parsed.entities],
-                parsed.intent,
-                result.need_retrieval,
-                result.need_scores,
-                action,
-            )
-            return result
-        except Exception as e:
-            logger.error("RouteLLM 调用失败: %s", e)
-            raise
+        return self.local_llm.chat_with_schema(
+            messages=messages,
+            response_schema=QueryParseResult,
+            temperature=0.0,
+            max_tokens=256,
+        )
+
+    def _parse_with_glm(self, user_content: str) -> QueryParseResult:
+        """上下文超限时用远程 GLM 完成 QueryParse，同样的 prompt，更大的上下文窗口。"""
+        messages = [
+            {"role": "system", "content": _PARSER_SYSTEM},
+            {"role": "user", "content": user_content},
+        ]
+        raw = self.glm.chat(messages, temperature=0.1, max_tokens=256)
+        content = (raw or "").strip()
+        if content.startswith("```"):
+            start = content.find("```") + 3
+            rest = content[start:]
+            if rest.startswith("json"):
+                rest = rest[4:].lstrip()
+            end = rest.find("```")
+            content = rest[:end].strip() if end >= 0 else rest.strip()
+        if not content.startswith("{"):
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start >= 0 and end > start:
+                content = content[start:end]
+        return QueryParseResult.model_validate_json(content)
 
 
 _route_llm_instance: Optional[RouteLLM] = None

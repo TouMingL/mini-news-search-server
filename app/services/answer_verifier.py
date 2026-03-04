@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -257,25 +258,38 @@ class AnswerVerifier:
         answer_scope_mode: str = "strict_date",
     ) -> VerificationResult:
         """
-        按顺序执行：捏造 -> 扣题 -> 时间对齐。任一项不通过即返回对应原因。
+        并行执行捏造+扣题两项 LLM 校验，再串行做规则式时间对齐。
         reference_date 为回答范围日期（answer_scope_date），由 pipeline 从 temporal_scope 推导传入；有值时才做时间对齐。
         answer_scope_mode 为目标日约束策略（strict_date / report_day_ok）。
         """
         if not answer or not answer.strip():
             return VerificationResult.fail(VerifyFailureReason.OFF_TOPIC)
 
+        # 捏造 + 扣题无数据依赖，并行调用 GLM API
         t0 = time.perf_counter()
-        fabrication_ok = self._verify_no_fabrication(context, answer, answer_scope_mode=answer_scope_mode)
-        fabrication_ms = (time.perf_counter() - t0) * 1000
-        logger.info("事实核查-捏造: {} | 耗时 {:.1f}ms", "通过" if fabrication_ok else "不通过", fabrication_ms)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fab_future = pool.submit(
+                self._verify_no_fabrication, context, answer, answer_scope_mode,
+            )
+            topic_future = pool.submit(
+                self._verify_on_topic, query, answer,
+            )
+            fabrication_ok = fab_future.result()
+            on_topic_ok = topic_future.result()
+        parallel_ms = (time.perf_counter() - t0) * 1000
+        fabrication_ms = parallel_ms
+        on_topic_ms = parallel_ms
+
+        logger.info(
+            "事实核查(并行): 捏造={}, 答非所问={} | 耗时 {:.1f}ms",
+            "通过" if fabrication_ok else "不通过",
+            "通过" if on_topic_ok else "不通过",
+            parallel_ms,
+        )
+
         if not fabrication_ok:
             logger.info("事实核查不通过：捏造")
             return VerificationResult.fail(VerifyFailureReason.FABRICATION, fabrication_ms=fabrication_ms)
-
-        t0 = time.perf_counter()
-        on_topic_ok = self._verify_on_topic(query, answer)
-        on_topic_ms = (time.perf_counter() - t0) * 1000
-        logger.info("事实核查-答非所问: {} | 耗时 {:.1f}ms", "通过" if on_topic_ok else "不通过", on_topic_ms)
         if not on_topic_ok:
             logger.info("事实核查不通过：答非所问")
             return VerificationResult.fail(
@@ -284,6 +298,7 @@ class AnswerVerifier:
                 on_topic_ms=on_topic_ms,
             )
 
+        # 时间对齐（规则式，无 LLM 调用，保持串行）
         t0 = time.perf_counter()
         time_ok = self._verify_temporal_alignment(answer, reference_date, current_date, answer_scope_mode=answer_scope_mode)
         if time_ok and context:
@@ -301,7 +316,7 @@ class AnswerVerifier:
                 temporal_ms=temporal_ms,
             )
 
-        total_ms = fabrication_ms + on_topic_ms + temporal_ms
+        total_ms = parallel_ms + temporal_ms
         logger.info("事实核查: 捏造=通过, 答非所问=通过, 时间对齐=通过 | 总耗时 {:.1f}ms", total_ms)
         return VerificationResult.ok(
             fabrication_ms=fabrication_ms,
@@ -316,7 +331,12 @@ class AnswerVerifier:
             src = item.get("source", "")
             title = item.get("title", "")
             raw = item.get("content") or ""
-            cap = 2000 if src == "赛况数据引擎" else 800
+            if src == "赛况数据引擎":
+                cap = 2000
+            elif src == "对话历史":
+                cap = 1500
+            else:
+                cap = 800
             content = raw[:cap] if cap else raw
             if len(raw) > cap:
                 content = content + "…（已截断）"
@@ -335,17 +355,17 @@ class AnswerVerifier:
                 "- 通过：回答开头声明「未检索到某日当天的比赛」并随后播报前几日事件，这是正常指令行为，不算捏造。"
             )
 
-        user_content = f"""你是事实核查员，只做一件事：判断「回答」中的事实是否都能在「检索到的新闻」中找到依据。
+        user_content = f"""你是事实核查员，只做一件事：判断「回答」中的事实是否都能在「提供的参考内容」中找到依据。
 
 规则：
-- 通过：回答中的事件、数据、来源名称、日期等均能在检索到的新闻中找到对应或合理归纳。
-- 不通过：回答中出现了检索结果里完全不存在的新闻事件、具体数据或来源名称（凭空编造）。
+- 通过：回答中的事件、数据、来源名称、日期等均能在参考内容中找到对应或合理归纳。
+- 不通过：回答中出现了参考内容里完全不存在的事件、具体数据或来源名称（凭空编造）。
 {date_rule}
-- 不通过：若检索内容中某场比赛标注为「进行中」，但回答中对该场使用了「获胜」「击败」「取胜」「险胜」等表示已结束的措辞，则判不通过（将进行中当作已结束即属捏造）。
+- 不通过：若参考内容中某场比赛标注为「进行中」，但回答中对该场使用了「获胜」「击败」「取胜」「险胜」等表示已结束的措辞，则判不通过（将进行中当作已结束即属捏造）。
 
-重要：本步骤只判断有无捏造，不判断是否扣题。即使用户问的是A而回答讲的是B，只要回答里的每一条事实（事件、数据、来源）都能在下方检索结果中找到，仍应判「通过」；仅当回答中出现检索结果中不存在的事件/数据/来源时判「不通过」。
+重要：本步骤只判断有无捏造，不判断是否扣题。即使用户问的是A而回答讲的是B，只要回答里的每一条事实（事件、数据、来源）都能在下方参考内容中找到，仍应判「通过」；仅当回答中出现参考内容中不存在的事件/数据/来源时判「不通过」。
 
-检索到的新闻：
+参考内容：
 {context_block}
 
 回答：

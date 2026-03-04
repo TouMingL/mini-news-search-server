@@ -184,6 +184,7 @@ class LLMService:
 - 若提供的检索结果中包含「来源：赛况数据引擎」的比分数据，且其中已有用户所问主体（如某球队）的比赛/比分信息，则仅根据该条作答即可，不得再追加与首条并列的「未检索到…」「未检索到关于XX其他…」等说明；仅在整份检索结果中均无与用户所问条件直接相关的内容时，才输出一句规则 5 规定的「未检索到相关信息」；
 - **赛况优先**：赛况数据引擎的比分优先于检索片段；若 context 里已有「来源：赛况数据引擎」的比分，禁止用检索到的新闻内容编造或改写比分数字，仅可转述赛况数据中的内容；
 - **数据缺失标注**：若赛况数据引擎的内容中包含以「注意：」开头的系统标注（如「注意：排名数据中未找到XX」「注意：XX数据暂无」），这些标注本身是可信事实。回答时应直接转述标注中的具体原因（如「排名数据中暂无XX队的信息，西部排名数据暂缺」），不可忽略标注而使用其他队伍/主体的数据代替，也不可笼统说「未检索到相关信息」而不说明具体缺失原因；
+- **对话历史（规则 1 的例外）**：若参考内容中包含「来源：对话历史」的条目，这些是之前对话中已确认的信息。当检索新闻不足以回答用户当前问题时，**必须**从对话历史中已确认的数据进行简单推理回答（如已知胜率推算败率、已知胜负场次计算总场数等），不受规则 1「仅限素材原文」的限制，无需标注【媒体名】出处。检索新闻与对话历史冲突时，以检索新闻为准。
 - 无任何相关信息时，仅输出规则 5 规定的标准表述，无其他多余内容。"""
 
     @staticmethod
@@ -308,6 +309,9 @@ class LLMService:
                 date_constraint += "\n"
             except ValueError:
                 pass
+        from app.services.pipeline_modules.search_helpers import _inject_date_into_query_for_search
+        display_query = _inject_date_into_query_for_search(query, reference_date) if reference_date else query
+
         return f"""请严格遵循以下回答要求：
 
 {instruction}
@@ -319,7 +323,7 @@ class LLMService:
 
 ---
 
-用户的问题：{query}"""
+用户的问题：{display_query}"""
 
     # 检测模糊日期的正则（用于决定是否需要调用日期修正）
     _VAGUE_DATE_RE = re.compile(
@@ -514,9 +518,77 @@ class LLMService:
             logger.warning(f"日期修正调用失败，返回原文: {e}")
             return answer
 
+    # ==================== 本地 SearchPlan（替代分步 decompose + expand）====================
+
+    _SEARCH_PLAN_SYSTEM = (
+        "检索查询规划助手。分析查询，输出JSON检索计划。"
+        "规则：含多个独立检索主体（A和B需分别检索）则拆为子查询，复合概念不拆（中美关系）。"
+        "每个子查询生成2-3个简短检索关键词变体，用新闻常用词（报道/行情/走势/赛果/比分），"
+        "避免口语词（最新动态/怎么样了）。"
+        '输出JSON：{"sub_queries":["..."],"search_keywords":[["kw1","kw2","kw3"]]}'
+    )
+
+    _SEARCH_PLAN_FEWSHOT = (
+        '用户:黄金行情->{"sub_queries":["黄金行情"],"search_keywords":[["黄金价格走势","金价行情","黄金市场动向"]]}\n'
+        '用户:伦敦金和COMEX指标->{"sub_queries":["伦敦金指标","COMEX指标"],"search_keywords":[["伦敦金价格","伦敦金走势"],["COMEX期货指标","COMEX黄金"]]}\n'
+        '用户:体育怎么样->{"sub_queries":["体育资讯"],"search_keywords":[["体育赛事新闻","体育资讯报道","体育比赛动态"]]}\n'
+        '用户:3月3日NBA比赛->{"sub_queries":["3月3日NBA比赛"],"search_keywords":[["3月3日NBA赛果","NBA 3月3日比分","3月3日NBA比赛结果"]]}'
+    )
+
+    def plan_search(
+        self,
+        query: str,
+        reference_date: Optional[str] = None,
+        current_date: Optional[str] = None,
+    ):
+        """
+        用本地 Qwen 模型一次性生成检索计划（查询分解 + 检索变体），替代远程 API 的分步 decompose + expand。
+        失败时返回 None，调用方回退到远程 API 分步逻辑。
+        """
+        from app.services.schemas import SearchPlan
+
+        if self._local_llm is None:
+            return None
+        try:
+            if not self._local_llm.is_available:
+                return None
+        except Exception:
+            return None
+
+        date_line = ""
+        if reference_date:
+            date_line = f"\n目标日期:{reference_date}。关键词应含该日期表述。"
+
+        user_content = f"{self._SEARCH_PLAN_FEWSHOT}{date_line}\n用户:{query}->"
+        messages = [
+            {"role": "system", "content": self._SEARCH_PLAN_SYSTEM},
+            {"role": "user", "content": user_content},
+        ]
+        try:
+            plan = self._local_llm.chat_with_schema(
+                messages=messages,
+                response_schema=SearchPlan,
+                temperature=0.1,
+                max_tokens=256,
+            )
+            if not plan.sub_queries:
+                plan.sub_queries = [query]
+            while len(plan.search_keywords) < len(plan.sub_queries):
+                idx = len(plan.search_keywords)
+                plan.search_keywords.append([plan.sub_queries[idx]])
+            logger.info(
+                "SearchPlan(本地Qwen): sub_queries=%s, keywords=%s",
+                plan.sub_queries,
+                plan.search_keywords,
+            )
+            return plan
+        except Exception as e:
+            logger.warning("SearchPlan 本地生成失败: %s, 将回退到远程 API", e)
+            return None
+
     def decompose_query(self, standalone_query: str) -> List[str]:
         """
-        将包含多个独立检索意图的查询分解为子查询。
+        将包含多个独立检索意图的查询分解为子查询（远程 GLM API，作为 plan_search 的后备）。
 
         单一意图（"黄金行情"）→ ["黄金行情"]
         多意图  （"伦敦金和COMEX指标"）→ ["伦敦金指标", "COMEX指标"]

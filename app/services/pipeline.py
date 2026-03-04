@@ -487,24 +487,36 @@ class Pipeline:
     ) -> tuple:
         """
         拆解用户意图，生成子查询，每个子查询独立检索。
-        判断是否需要拆分查询，每个子查询独立检索。
+        优先用本地 Qwen 的 plan_search 一次性完成分解+变体生成；失败时回退到远程 GLM API 分步逻辑。
         单一意图且 original_query != standalone_query 时做双轨检索（原始 query 一轨 + 改写变体一轨）并 RRF 融合。
 
         Returns:
             (search_results, all_search_queries, covered_sub_queries, missed_sub_queries)
         """
-        sub_queries = self.llm_service.decompose_query(standalone_query)
+        search_standalone_query = _inject_date_into_query_for_search(standalone_query, reference_date)
+
+        # 优先用本地 Qwen 一次性生成检索计划（消除 2 次远程 API 调用）
+        search_plan = self.llm_service.plan_search(
+            search_standalone_query,
+            reference_date=reference_date,
+            current_date=current_date,
+        )
+        if search_plan is not None:
+            sub_queries = search_plan.sub_queries
+        else:
+            sub_queries = self.llm_service.decompose_query(standalone_query)
 
         if len(sub_queries) <= 1:
             # ---- 单一意图：改写变体检索 ----
-            # 检索用查询将相对时间替换为具体日期，便于与新闻标题/正文匹配
-            search_standalone_query = _inject_date_into_query_for_search(standalone_query, reference_date)
-            search_queries = self.llm_service.expand_queries_for_search(
-                search_standalone_query,
-                num_variants=3,
-                reference_date=reference_date,
-                current_date=current_date,
-            )
+            if search_plan is not None and search_plan.search_keywords:
+                search_queries = search_plan.search_keywords[0]
+            else:
+                search_queries = self.llm_service.expand_queries_for_search(
+                    search_standalone_query,
+                    num_variants=3,
+                    reference_date=reference_date,
+                    current_date=current_date,
+                )
             logger.info(f"检索查询(扩展): {search_queries}")
             results_rewritten = self._search_hybrid(
                 search_queries=search_queries,
@@ -560,19 +572,22 @@ class Pipeline:
         # ---- 多意图：并发检索 ----
         logger.info(f"多意图查询分解: {sub_queries}")
 
-        # Step 1: 生成各子查询的检索变体（子查询中的相对时间替换为具体日期）
+        # Step 1: 生成各子查询的检索变体
         sub_variants: Dict[str, List[str]] = {}
         sub_q_to_search_query: Dict[str, str] = {}
         all_search_queries: List[str] = []
-        for sub_q in sub_queries:
+        for i, sub_q in enumerate(sub_queries):
             search_sub_q = _inject_date_into_query_for_search(sub_q, reference_date)
             sub_q_to_search_query[sub_q] = search_sub_q
-            variants = self.llm_service.expand_queries_for_search(
-                search_sub_q,
-                num_variants=2,
-                reference_date=reference_date,
-                current_date=current_date,
-            )
+            if search_plan is not None and i < len(search_plan.search_keywords):
+                variants = search_plan.search_keywords[i]
+            else:
+                variants = self.llm_service.expand_queries_for_search(
+                    search_sub_q,
+                    num_variants=2,
+                    reference_date=reference_date,
+                    current_date=current_date,
+                )
             sub_variants[sub_q] = variants
             all_search_queries.extend(variants)
             logger.info(f"  子查询 '{sub_q}' 检索变体: {variants}")
@@ -1196,6 +1211,7 @@ class Pipeline:
                 standalone_query=standalone_query,
                 original_query=original_query,
                 input_data=input_data,
+                history=history,
                 tracer=tracer,
                 rewrite_reasoning=rewrite_reasoning,
                 classification=classification,
@@ -1235,7 +1251,7 @@ class Pipeline:
             ctx      = _slim_scores_context(data, score_query, intent=_intent,
                                             was_filtered=was_filtered, want_detail=want_detail,
                                             player_filter=_pf, queried_teams=_qt)
-            messages = self._build_scores_answer_messages(score_query, ctx)
+            messages = self._build_scores_answer_messages(score_query, ctx, history)
             if tracer:
                 tracer.record_glm_prompt(
                     system_prompt=messages[0]["content"],
@@ -1384,7 +1400,8 @@ class Pipeline:
                     reference_date=ref_date or search_params.get("reference_datetime"),
                     answer_scope_mode=answer_scope_mode,
                 )
-            if not search_results:
+            history_ctx = self._history_as_context(history)
+            if not search_results and not history_ctx:
                 for event in self.llm_service.generate_no_result_reply_stream(
                     query=standalone_query,
                     reference_date=answer_scope_date,
@@ -1394,6 +1411,7 @@ class Pipeline:
                         yield _sanitize_event(event)
                 yield _sanitize_event({"sources": [], "done": True})
                 return
+            combined_context = search_results + history_ctx
             sources = [
                 {
                     "title": item.get("title"),
@@ -1412,7 +1430,7 @@ class Pipeline:
                 _sys_prompt = _LLM._build_news_system_prompt()
                 _ctx_text = "\n\n".join(
                     f"{i}. {_LLM._format_news_item(item)}"
-                    for i, item in enumerate(search_results, 1)
+                    for i, item in enumerate(combined_context, 1)
                 )
                 _user_text = _LLM._build_news_user_prompt(
                     _ctx_text, standalone_query, coverage_note,
@@ -1432,7 +1450,7 @@ class Pipeline:
             stream_accumulated = []
             for event in self.llm_service.generate_answer_stream(
                 query=standalone_query,
-                context=search_results,
+                context=combined_context,
                 deep_think=deep_think,
                 coverage_note=coverage_note,
                 original_query=original_query,
@@ -1456,7 +1474,7 @@ class Pipeline:
             result = self.answer_verifier.verify(
                 query=standalone_query,
                 answer=full_answer,
-                context=search_results,
+                context=combined_context,
                 reference_date=answer_scope_date,
                 current_date=cur_date,
                 answer_scope_mode=answer_scope_mode,
@@ -1464,7 +1482,7 @@ class Pipeline:
             if not result.passed:
                 yield _sanitize_event({"replace": get_replacement_message(result.failure_reason), "verification_result": result})
             else:
-                final = self.llm_service.post_process_answer(full_answer, search_results)
+                final = self.llm_service.post_process_answer(full_answer, combined_context)
                 yield _sanitize_event({"replace": final, "verification_result": result})
             yield _sanitize_event({"sources": sources, "done": True})
         elif route_decision.action in ("tool_quote", "tool_weather"):
@@ -1487,7 +1505,7 @@ class Pipeline:
             ctx      = _slim_scores_context(data, score_query, intent=_intent,
                                             was_filtered=was_filtered, want_detail=want_detail,
                                             player_filter=_pf, queried_teams=_qt)
-            messages = self._build_scores_answer_messages(score_query, ctx)
+            messages = self._build_scores_answer_messages(score_query, ctx, history)
             if tracer:
                 tracer.record_glm_prompt(
                     system_prompt=messages[0]["content"],
@@ -1532,6 +1550,7 @@ class Pipeline:
         standalone_query:   str,
         original_query:     str,
         input_data:         PipelineInput,
+        history:            Optional[List[HistoryMessage]] = None,
         tracer:             Optional[PipelineTracer] = None,
         rewrite_reasoning:  Optional[str] = None,
         classification:     Optional[ClassificationResult] = None,
@@ -1659,13 +1678,16 @@ class Pipeline:
                 answer_scope_mode=answer_scope_mode,
             )
         
-        if not search_results:
+        history_ctx = self._history_as_context(history)
+        if not search_results and not history_ctx:
             reply = self.llm_service.generate_no_result_reply(
                 query=standalone_query,
                 reference_date=answer_scope_date,
                 current_date=current_date,
             )
             return reply, [], 0
+
+        combined_context = search_results + history_ctx
 
         # -- trace: 重建 GLM 完整 prompt --
         # 使用 standalone_query（已融合历史上下文），避免歧义代词导致 LLM 无法理解
@@ -1674,7 +1696,7 @@ class Pipeline:
             _sys_prompt = _LLM._build_news_system_prompt()
             _ctx_text = "\n\n".join(
                 f"{i}. {_LLM._format_news_item(item)}"
-                for i, item in enumerate(search_results, 1)
+                for i, item in enumerate(combined_context, 1)
             )
             _user_text = _LLM._build_news_user_prompt(
                 _ctx_text, standalone_query, coverage_note,
@@ -1694,7 +1716,7 @@ class Pipeline:
         # 3. LLM 生成回答（仅生成，不在此处校验）
         answer = self.llm_service.generate_answer(
             query=standalone_query,
-            context=search_results,
+            context=combined_context,
             coverage_note=coverage_note,
             original_query=original_query,
             rewrite_reasoning=rewrite_reasoning,
@@ -1717,7 +1739,7 @@ class Pipeline:
         result = self.answer_verifier.verify(
             query=standalone_query,
             answer=answer,
-            context=search_results,
+            context=combined_context,
             reference_date=answer_scope_date,
             current_date=current_date,
             answer_scope_mode=answer_scope_mode,
@@ -1725,9 +1747,9 @@ class Pipeline:
         if not result.passed:
             answer = get_replacement_message(result.failure_reason)
         else:
-            answer = self.llm_service.post_process_answer(answer, search_results)
+            answer = self.llm_service.post_process_answer(answer, combined_context)
         
-        # 4. 格式化来源
+        # 4. 格式化来源（仅包含检索结果，不含对话历史条目）
         sources = [
             {
                 "title": item.get("title"),
@@ -1766,26 +1788,55 @@ class Pipeline:
         return answer, [], 0
 
     @staticmethod
+    def _history_as_context(history: Optional[List[HistoryMessage]]) -> List[Dict[str, Any]]:
+        """将对话历史格式化为 pseudo-search-result 条目，作为 RAG 和验证器的基础上下文层。"""
+        if not history:
+            return []
+        lines = []
+        for msg in history:
+            role = "用户" if msg.role == "user" else "助手"
+            lines.append(f"[{role}] {msg.content}")
+        return [{
+            "source": "对话历史",
+            "title": "之前的对话记录",
+            "content": "\n".join(lines),
+        }]
+
+    @staticmethod
     def _build_scores_answer_messages(
         query: str,
         scores_context: str,
+        history: Optional[List[HistoryMessage]] = None,
     ) -> List[Dict[str, str]]:
         """
-        基于已裁剪的赛况数据上下文构建 LLM 消息，用于生成针对用户问题的精准回答。
+        基于赛况数据 + 对话历史构建分层上下文 LLM 消息，用于生成针对用户问题的精准回答。
 
-        系统提示要求 LLM 仅凭提供的数据作答，直接回答问题，不展示冗余数据，不编造。
+        赛况数据为最高优先级数据源；对话历史作为基础上下文层，仅在赛况数据不足时参考。
         """
         system = (
-            "你叫菠萝包，是专业的 NBA 数据播报助手。\n"
+            "你叫菠萝包，是专业的体育数据播报助手。\n"
             "规则（严格遵守）：\n"
-            "1. 只基于下方「赛况数据」回答，严禁使用训练知识补充任何数据。\n"
-            "2. 直接回答用户问题，不重复列出与问题无关的条目。\n"
-            "3. 回答时把命中条目的关键数据一并带出（战绩、胜率、连胜/连败、得分等），"
-            "让用户一句话获得完整信息，但不要罗列无关条目。\n"
-            "4. 数据不足以回答时，如实说明「当前数据不足以回答该问题」。\n"
-            "5. 用中文作答，一两句话说清楚。"
+            "1. 严禁使用训练知识补充任何数据，只能使用下方提供的信息。\n"
+            "2. 若「赛况数据」能回答问题，以赛况数据为准。\n"
+            "3. 若赛况数据不足，可从「对话历史」中已出现的信息进行简单推理回答。\n"
+            "4. 两个来源冲突时，以赛况数据为准。\n"
+            "5. 直接回答用户问题，把关键数据一并带出，不罗列无关条目。\n"
+            "6. 所有来源均不足以回答时，如实说明「当前数据不足以回答该问题」。\n"
+            "7. 用中文作答，一两句话说清楚。"
         )
-        user = f"赛况数据：\n{scores_context}\n\n用户问题：{query}"
+        if not history:
+            history_text = "(无)"
+        else:
+            lines = []
+            for msg in history:
+                role = "用户" if msg.role == "user" else "助手"
+                lines.append(f"[{role}] {msg.content}")
+            history_text = "\n".join(lines)
+        user = (
+            f"赛况数据（实时，最高优先级）：\n{scores_context}\n\n"
+            f"对话历史（仅当赛况数据不足时可参考）：\n{history_text}\n\n"
+            f"用户问题：{query}"
+        )
         return [
             {"role": "system", "content": system},
             {"role": "user",   "content": user},

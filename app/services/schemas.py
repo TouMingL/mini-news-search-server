@@ -134,11 +134,11 @@ class QueryEntity(BaseModel):
 
 class QueryParseResult(BaseModel):
     """Parser LLM 输出：对用户查询的结构化理解，用于下游规则推导路由决策。"""
-    entities: List[QueryEntity] = Field(default_factory=list, description="提取的实体列表")
-    intent: QueryIntentType = Field(default="general_query", description="用户意图类型")
-    category: FILTER_CATEGORY = Field(default="general", description="查询主类别")
+    entities:         List[QueryEntity] = Field(default_factory=list, description="提取的实体列表")
+    intent:           QueryIntentType = Field(default="general_query", description="用户意图类型")
+    category:         FILTER_CATEGORY = Field(default="general", description="查询主类别")
     time_sensitivity: TimeSensitivity = Field(default="none", description="时效性")
-    follow_up_type: Optional[FollowUpType] = Field(default=None, description="追问类型；非追问时为 None")
+    follow_up_type:   Optional[FollowUpType] = Field(default=None, description="追问类型；非追问时为 None")
 
     @field_validator("follow_up_type", mode="before")
     @classmethod
@@ -146,6 +146,28 @@ class QueryParseResult(BaseModel):
         """小模型常输出字符串 "null" 而非 JSON null。"""
         if v == "null" or v == "None":
             return None
+        return v
+
+
+class SearchPlan(BaseModel):
+    """检索计划：查询分解 + 检索变体，由本地 Qwen 一次性输出，替代分步的 decompose + expand。"""
+    sub_queries: List[str] = Field(description="独立检索意图，单意图时只有一个元素")
+    search_keywords: List[List[str]] = Field(description="每个子查询的 2-3 个检索关键词变体")
+
+    @field_validator("sub_queries", mode="before")
+    @classmethod
+    def _ensure_sub_queries_list(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return [v]
+        return v
+
+    @field_validator("search_keywords", mode="before")
+    @classmethod
+    def _ensure_nested_list(cls, v: Any) -> Any:
+        if not v:
+            return v
+        if isinstance(v, list) and v and isinstance(v[0], str):
+            return [v]
         return v
 
 
